@@ -25,7 +25,8 @@ int main(int argc, char* argv[]) {
 
     MediumSilicon si;
     si.SetTemperature(293.15);
-    si.SetImpactIonisationModelOkutoCrowell();
+    // si.SetImpactIonisationModelOkutoCrowell();
+    si.SetImpactIonisationModelMassey();
 
     ComponentTcad2d field;
     if (!field.InitialiseSilvaco(file)) {
@@ -74,8 +75,8 @@ int main(int argc, char* argv[]) {
 
     // MIP
     TrackHeed track(&sensor);
-    track.SetParticle("pion");
-    track.SetMomentum(180.e9);
+    track.SetParticle("electron");
+    track.SetMomentum(9.e10);
     track.EnableDeltaElectronTransport();
 
     // Charge Transport and Avalanche
