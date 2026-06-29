@@ -25,8 +25,7 @@ int main(int argc, char* argv[]) {
 
     MediumSilicon si;
     si.SetTemperature(293.15);
-    // si.SetImpactIonisationModelOkutoCrowell();
-    si.SetImpactIonisationModelMassey();
+    si.SetImpactIonisationModelOkutoCrowell();
 
     ComponentTcad2d field;
     if (!field.InitialiseSilvaco(file)) {
