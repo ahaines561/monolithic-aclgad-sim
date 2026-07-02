@@ -16,8 +16,7 @@ int main(int argc, char* argv[]) {
 
   const std::string file =
       argc > 1 ? argv[1]
-               : "/home/ahaines561/HEP/MAS/Silvaco_dat"
-                 "30kev5umsp_5um_X26.sta";
+               : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad.sta";
 
   ComponentTcad2d cmp;
   if (!cmp.InitialiseSilvaco(file)) {
@@ -25,9 +24,16 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  TCanvas* c = new TCanvas("c", "Silvaco mesh", 1200, 350);
-  TH2F* frame = new TH2F("frame", "Silvaco mesh;x [um];y [um]",
-                         10, 0., 250., 10, -4., 51.);
+  double xmin, ymin, zmin, xmax, ymax, zmax;
+  cmp.GetBoundingBox(xmin, ymin, zmin, xmax, ymax, zmax);
+  xmin *= 1.e4; xmax *= 1.e4;
+  ymin *= 1.e4; ymax *= 1.e4;
+  double dx = (xmax - xmin) * 0.05;
+  double dy = (ymax - ymin) * 0.05;
+
+  TCanvas* c = new TCanvas("c", "Silvaco mesh", 1200, 600);
+  // TH2F* frame = new TH2F("frame", "Silvaco mesh;x [um];y [um]", 10, xmin - dx, xmax + dx, 10, ymin - dy, ymax + dy);
+  TH2F* frame = new TH2F("frame", "Silvaco mesh;x [um];y [um]", 10, xmin, xmax, 10, -1.5, 2.0);
   frame->SetStats(0);
   frame->Draw();
 

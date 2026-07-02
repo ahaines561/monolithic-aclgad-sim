@@ -16,7 +16,7 @@ int main(int argc, char* argv[]) {
   const std::string file =
       argc > 1 ? argv[1]
                : "/home/ahaines561/HEP/MAS/Silvaco_dat/"
-                 "30kev5umsp_5um_X26.sta";
+                 "lgad.sta";
 
   ComponentTcad2d cmp;
   if (!cmp.InitialiseSilvaco(file)) {

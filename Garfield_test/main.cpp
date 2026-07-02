@@ -114,7 +114,7 @@ int main(int argc, char* argv[]) {
     }
 
     // sanity check
-    std::cout << "\n=== device summary ===\n";
+    std::cout << "\n device summary \n";
     std::cout << "file   : " << file << "\n";
     std::cout << "bounds : x[" << xmin << ", " << xmax << "]  y[" << ymin
               << ", " << ymax << "] cm\n";
@@ -128,7 +128,6 @@ int main(int argc, char* argv[]) {
     if (nSiRegions == 0) {
         std::cerr << "WARNING: no silicon regions found - check 'r' records!\n";
     }
-    std::cout << "======================\n\n";
 
     // -geometry from bounds
     const double ySi_Top = ymin;
