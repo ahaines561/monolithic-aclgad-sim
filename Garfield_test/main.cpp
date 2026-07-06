@@ -1,284 +1,98 @@
-#include <iostream>
-#include <string>
-#include <vector>
-#include <map>
-#include <sstream>
-#include <fstream>
 #include <cmath>
-#include <limits>
+#include <cstdlib>
+#include <fstream>
+#include <vector>
+#include <iostream>
 #include <TApplication.h>
 #include <TCanvas.h>
-#include <TH1F.h>
 
-#include "Garfield/MediumSilicon.hh"
 #include "Garfield/ComponentTcad2d.hh"
-#include "Garfield/ComponentUser.hh"
+#include "Garfield/ComponentConstant.hh"
+#include "Garfield/MediumSilicon.hh"
 #include "Garfield/Sensor.hh"
+#include "Garfield/GeometrySimple.hh"
+#include "Garfield/SolidBox.hh"
 #include "Garfield/TrackHeed.hh"
 #include "Garfield/AvalancheMC.hh"
 #include "Garfield/ViewSignal.hh"
 
 using namespace Garfield;
 
-// read mesh bounds
-bool GetMeshBounds(const std::string& path, double& xmin, double& ymin,
-                   double& xmax, double& ymax) {
-    std::ifstream fh(path);
-    if (!fh) return false;
-    xmin = ymin = std::numeric_limits<double>::max();
-    xmax = ymax = std::numeric_limits<double>::lowest();
-    std::string line;
-    bool found = false;
-    while (std::getline(fh, line)) {
-        if (line.empty() || line[0] != 'c') continue;
-        std::istringstream ss(line);
-        std::string tag; double id, x, y;
-        if (!(ss >> tag >> id >> x >> y) || tag != "c") continue;
-        xmin = std::min(xmin, x); xmax = std::max(xmax, x);
-        ymin = std::min(ymin, y); ymax = std::max(ymax, y);
-        found = true;
-    }
-    if (!found) return false;
-    xmin *= 1.e-4; xmax *= 1.e-4; ymin *= 1.e-4; ymax *= 1.e-4;
-    return true;
-}
-
-// read region->material map from the 'r id material' records
-std::map<int, std::string> GetRegionMaterials(const std::string& path) {
-    std::map<int, std::string> mats;
-    std::ifstream fh(path);
-    if (!fh) return mats;
-    std::string line;
-    while (std::getline(fh, line)) {
-        if (line.empty() || line[0] != 'r') continue;
-        std::istringstream ss(line);
-        std::string tag; int id; std::string material;
-        if (!(ss >> tag >> id >> material) || tag != "r") continue;
-        mats[id] = material;
-    }
-    return mats;
-}
-
 int main(int argc, char* argv[]) {
     TApplication app("app", &argc, argv);
+    const std::string file = argc > 1 ? argv[1]
+        : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad.sta";
 
-    const std::string file =
-        argc > 1 ? argv[1]
-                 : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad.sta";
-
-    // signal timing granularity
-    const int nBins = 1000;
-    const double tmax = 5.0;
-    const double dt = tmax / nBins;
-    const int nEvents = 10000;
-    int totElectronsEvent0 = 0;
-    int totHolesEvent0 = 0;
-    int nPrimaryEvent0 = 0;
-    int nPrimaryE = 0;
-    int eDone = 0;
-    bool signalDone = false;
-    double avgGain = 0.0;
-    double t = 0.0;
-    double current = 0.0;
-
-    const bool readoutAtTop = true;
-    const double tauAC = 0.5;
-
+    ComponentTcad2d cmp;
+    cmp.InitialiseSilvaco(file);
     MediumSilicon si;
     si.SetTemperature(293.15);
-    si.SetImpactIonisationModelOkutoCrowell();
-    // si.SetImpactIonisationModelMassey();
-    si.SetSaturationVelocityModelCanali();
+    si.SetImpactIonisationModelMassey();
+    cmp.SetMedium("3", &si);
+    cmp.SetRangeZ(-5.e-4, 5.e-4);
+    cmp.PrintRegions();
 
-    ComponentTcad2d field;
-    if (!field.InitialiseSilvaco(file)) {
-        std::cerr << "InitialiseSilvaco FAILED\n";
+    double bx0 = 0., by0 = 0., bz0 = 0., bx1 = 0., by1 = 0., bz1 = 0.;
+    if (!cmp.GetBoundingBox(bx0, by0, bz0, bx1, by1, bz1)) {
+        std::cerr << "Could not get the bounding box from the field map;\n"
+                << "set the device extent manually in the macro.\n";
         return 1;
     }
+    std::cout << "map extent: x = [" << bx0 * 1.e4 << ", " << bx1 * 1.e4
+                << "] um, y = [" << by0 * 1.e4 << ", " << by1 * 1.e4
+                << "] um" << std::endl; 
+    const double x0 = 0.5 * (bx0 + bx1) + 0.13e-4;
+    
+    // Scans the full bounding box
+std::cout << "# y[um]   V[V]   Ey[V/cm]\n";
+double eMax = 0., yGain = 0.;
+double yTop = 1., yBot = -1.; 
+const int nScan = 400;
+  for (int i = 0; i <= nScan; ++i) {
+    const double y = by0 + ((by1 - by0) * i) / nScan;
+    double ex, ey, ez, v; int st; Medium* m = nullptr;
+    cmp.ElectricField(x0, y, 0., ex, ey, ez, v, m, st);
+    if (st != 0) continue;
+    if (yTop > yBot) yTop = y;
+    yBot = y;
+    const double e = std::sqrt(ex * ex + ey * ey);
+    if (e > eMax) { eMax = e; yGain = y; }
+    std::cout << y * 1.e4 << "  " << v << "  " << ey << "\n";
+  }
+  if (yTop > yBot) {
+    std::cerr << "No valid drift medium found along the scan line --\n"
+              << "check the region/material assignment above.\n";
+    return 1;
+  }
+  const double d = yBot - yTop;   // drift thickness
+  std::cout << "active silicon: y = [" << yTop * 1.e4 << ", "
+            << yBot * 1.e4 << "] um (d = " << d * 1.e4 << " um)"
+            << std::endl;
+  std::cout << "Peak field " << eMax << " V/cm at y = " << yGain * 1.e4
+            << " um  (gain layer)" << std::endl;
+  if (eMax < 2.5e5) {
+    std::cout << "NOTE: peak field < 250 kV/cm -- expect gain near 1 "
+              << "at this bias." << std::endl;
+  }
 
-    // read geometry
-    double xmin, ymin, xmax, ymax;
-    if (!GetMeshBounds(file, xmin, ymin, xmax, ymax)) {
-        std::cerr << "GetMeshBounds FAILED\n";
-        return 1;
-    }
-    const auto mats = GetRegionMaterials(file);
-
-    // assign si to mat
-    int nSiRegions = 0;
-    const std::size_t nReg = field.GetNumberOfRegions();
-    for (std::size_t i = 0; i < nReg; ++i) {
-        std::string material = mats.count(i) ? mats.at(i) : "";
-        bool isSilicon = (material == "1" || material == "3");
-        if (isSilicon) { field.SetMedium(i, &si); ++nSiRegions; }
-    }
-
-    // sanity check
-    std::cout << "\n device summary \n";
-    std::cout << "file   : " << file << "\n";
-    std::cout << "bounds : x[" << xmin << ", " << xmax << "]  y[" << ymin
-              << ", " << ymax << "] cm\n";
-    std::cout << "regions: " << nReg << " total, " << nSiRegions << " silicon\n";
-    for (std::size_t i = 0; i < nReg; ++i) {
-        std::string material = mats.count(i) ? mats.at(i) : "";
-        std::cout << "  region " << i << " material='" << material << "'"
-                  << ((material == "1" || material == "3") ? " -> silicon" : "")
-                  << "\n";
-    }
-    if (nSiRegions == 0) {
-        std::cerr << "WARNING: no silicon regions found - check 'r' records!\n";
-    }
-
-    // -geometry from bounds
-    const double ySi_Top = ymin;
-    const double ySi_Bot = ymax;
-    const double xCenter = 0.5 * (xmin + xmax);
-    const double thickness = ySi_Bot - ySi_Top;
-
-    ComponentUser wpad;
-    wpad.SetArea(xmin, ymin, -1., xmax, ymax, 1.);
-    wpad.SetMedium(&si);
-    // linear weighting potential; readout at ySi_Top (flip if readoutAtTop=false)
-    wpad.SetWeightingPotential(
-        [ySi_Top, ySi_Bot, readoutAtTop](const double, const double y, const double) {
-            const double yc = std::min(std::max(y, ySi_Top), ySi_Bot);
-            const double w = (ySi_Bot - yc) / (ySi_Bot - ySi_Top);
-            return readoutAtTop ? w : (1.0 - w);
-        }, "pad");
-    wpad.SetWeightingField(
-        [ySi_Top, ySi_Bot, readoutAtTop](const double, const double y, const double,
-                     double& wx, double& wy, double& wz) {
-            wx = 0.;
-            const double mag = 1.0 / (ySi_Bot - ySi_Top);
-            wy = (y >= ySi_Top && y <= ySi_Bot) ? (readoutAtTop ? mag : -mag) : 0.;
-            wz = 0.;
-        }, "pad");
-
-    // Sensor
-    Sensor sensor;
-    sensor.AddComponent(&field);
-    sensor.AddElectrode(&wpad, "pad");
-    sensor.SetTimeWindow(0., dt, nBins);
-    sensor.SetArea(xmin, ymin, -1., xmax, ymax, 1.);
-
-    // MIP
-    TrackHeed track(&sensor);
-    track.SetParticle("pion");
-    track.SetMomentum(180.e9);
-    track.EnableDeltaElectronTransport();
-
-    // Avalanche
-    AvalancheMC aval(&sensor);
-    aval.SetTimeSteps(0.001);
-    aval.EnableSignalCalculation();
-    aval.EnableAvalancheSizeLimit(100);
-    aval.SetTimeWindow(0., 10.0);
-
-    TH1F* hLandau = new TH1F("hLandau", "Primary Charge Distribution;Total Primary Electrons;Frequency", 100, -100, 5000);
-
-    // start the track near the back face, drifting down through the depth
-    const double yStart = ySi_Bot - 0.1 * thickness;
-
-    std::cout << "Shooting " << nEvents << " pions...\n";
-
-    for (int i = 0; i < nEvents; ++i) {
-        track.NewTrack(xCenter, yStart, 0., 0., 0., -1., 0.);
-
-        const auto& clusters = track.GetClusters();
-        nPrimaryE = 0;
-        for (const auto& cluster : clusters) {
-            nPrimaryE += cluster.electrons.size();
-        }
-        hLandau->Fill(nPrimaryE);
-        // generate the waveform on the first event with enough primaries
-        if (!signalDone && nPrimaryE > 1000){
-            signalDone = true;
-            std::cout << "\nRunning full Avalanche on event " << i << " (primaries: " << nPrimaryE << ")...\n";
-            nPrimaryEvent0 = nPrimaryE;
-            eDone = 0;
-            for (const auto& cluster : clusters){
-                for (const auto& e : cluster.electrons) {
-                    aval.AvalancheElectronHole(e.x, e.y, e.z, e.t);
-                    totElectronsEvent0 += aval.GetElectrons().size();
-                    totHolesEvent0 += aval.GetHoles().size();
-                    eDone++;
-                    if (eDone % 50 == 0 || eDone == nPrimaryE) {
-                        std::cout << "  Avalanched " << eDone << "/" << nPrimaryE
-                                  << " primary electrons ("
-                                  << static_cast<int>(100.0 * eDone / nPrimaryE) << "%)\r"
-                                  << std::flush;
-                    }
-                }
-            }
-            std::cout << "\nEvent avalanche complete. Landau generation continues ...\n";
-        }
-        if (i > 0 && i % 500 == 0) {
-            std::cout << "  Processed " << i << " total events...\r" << std::flush;
-        }
-    }
-    std::cout << "\nFinished " << nEvents << " events.\n";
-    if (nPrimaryEvent0 > 0) {
-        avgGain = static_cast<double>(totElectronsEvent0) / nPrimaryEvent0;
-    }
-    std::cout << "Gain: " << avgGain << "\n";
-
-    // save the raw (DC) signal before AC coupling
-    std::ofstream rawfile("dc_signal.txt");
-    if (rawfile.is_open()){
-        rawfile << "Time_ns\tCurrent\n";
-        for (int i = 0; i < nBins; ++i) {
-            t = (i + 0.5) * dt;
-            rawfile << t << "\t" << sensor.GetSignal("pad", i) << "\n";
-        }
-        rawfile.close();
-    }
-
-    // plot the raw DC pulse
-    TCanvas* c0 = new TCanvas("c0", "DC Pulse (raw)", 800, 600);
-    ViewSignal svDC(&sensor);
-    svDC.SetCanvas(c0);
-    svDC.PlotSignal("pad", "t");
-    c0->Update();
-    c0->SaveAs("dc_pulse.png");
-
-    // AC coupling: bipolar CR high-pass kernel -> bipolar AC-LGAD shape
-    sensor.SetTransferFunction(
-        [tauAC](double tt) {
-            return (tt < 0.) ? 0.
-                             : (1.0 - tt / tauAC) * std::exp(-tt / tauAC) / tauAC;
-        });
-    sensor.ConvoluteSignals();
-
-    // stats + AC signal
-    std::ofstream outfile("avalanche_results.txt");
-    if (outfile.is_open()){
-        outfile << "--- Event 0 AC-LGAD Summary ---\n";
-        outfile << "Primary pairs: " << nPrimaryEvent0 << "\n";
-        outfile << "Total electrons: " << totElectronsEvent0 << "\n";
-        outfile << "Total holes: " << totHolesEvent0 << "\n";
-        outfile << "Gain: " << avgGain << "\n";
-        outfile << "\n--- AC Signal Data ---\nTime_ns\tCurrent\n";
-        for (int i = 0; i < nBins; ++i) {
-            t = (i + 0.5) * dt;
-            current = sensor.GetSignal("pad", i);
-            outfile << t << "\t" << current << "\n";
-        }
-        outfile.close();
-    }
-
-    // plot the AC-coupled (bipolar) pulse
-    TCanvas* c1 = new TCanvas("c1", "AC-LGAD Pulse", 800, 600);
-    ViewSignal sv(&sensor);
-    sv.SetCanvas(c1);
-    sv.PlotSignal("pad", "t");
-    c1->Update();
-    c1->SaveAs("ac_pulse.png");
-
-    TCanvas* c2 = new TCanvas("c2", "Landau Distribution", 800, 600);
-    hLandau->Draw();
-    c2->Update();
-    c2->SaveAs("landau_histogram.png");
-
-    app.Run();
-    return 0;
+  // Weighting field pproximation
+  ComponentConstant wcmp;
+  wcmp.SetArea(bx0, yTop, -5.e-4, bx1, yBot, 5.e-4);
+  wcmp.SetMedium(&si);
+  wcmp.SetElectricField(0., 0., 0.);
+  wcmp.SetWeightingField(0., 1. / d, 0., "pad");
+  wcmp.SetWeightingPotential(0., 0., 0., 1.);
+  {
+    double wx = 0., wy = 0., wz = 0.;
+    wcmp.WeightingField(125.e-4, 25.e-4, 0., wx, wy, wz, "pad");
+    std::cout << "Ew at centre = (" << wx << ", " << wy << ", " << wz
+              << ")  [expect (0, 200, 0)]" << std::endl;
+    std::cout << "wpot: top = "
+              << wcmp.WeightingPotential(125.e-4, 0., 0., "pad")
+              << ", mid = "
+              << wcmp.WeightingPotential(125.e-4, 25.e-4, 0., "pad")
+              << ", back = "
+              << wcmp.WeightingPotential(125.e-4, 50.e-4, 0., "pad")
+              << "  [expect 1, 0.5, 0]" << std::endl;
+  }
 }

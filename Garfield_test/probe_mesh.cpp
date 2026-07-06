@@ -32,8 +32,8 @@ int main(int argc, char* argv[]) {
   double dy = (ymax - ymin) * 0.05;
 
   TCanvas* c = new TCanvas("c", "Silvaco mesh", 1200, 600);
-  // TH2F* frame = new TH2F("frame", "Silvaco mesh;x [um];y [um]", 10, xmin - dx, xmax + dx, 10, ymin - dy, ymax + dy);
-  TH2F* frame = new TH2F("frame", "Silvaco mesh;x [um];y [um]", 10, xmin, xmax, 10, -1.5, 2.0);
+  TH2F* frame = new TH2F("frame", "Silvaco mesh;x [um];y [um]", 10, xmin - dx, xmax + dx, 10, ymin - dy, ymax + dy);
+  // TH2F* frame = new TH2F("frame", "Silvaco mesh;x [um];y [um]", 10, xmin, xmax, 10, -1.5, 2.0);
   frame->SetStats(0);
   frame->Draw();
 

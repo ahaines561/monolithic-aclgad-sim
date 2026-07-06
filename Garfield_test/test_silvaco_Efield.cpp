@@ -19,18 +19,19 @@ int main(int argc, char* argv[]) {
                  "lgad.sta";
 
   ComponentTcad2d cmp;
-  if (!cmp.InitialiseSilvaco(file)) {
-    std::cerr << "InitialiseSilvaco FAILED on " << file << "\n";
-    return 1;
-  }
+  cmp.InitialiseSilvaco(file);
   MediumSilicon si;
   for (std::size_t i = 0; i < cmp.GetNumberOfRegions(); ++i) {
     cmp.SetMedium(i, &si);
   }
 
-  // the physical silicon
-  const double x0 = 0., y0 = -4e-4;
-  const double x1 = 250.e-4, y1 = 50.e-4;
+  // the physical silicon for 30keV
+  // const double x0 = 0., y0 = -4e-4;
+  // const double x1 = 250.e-4, y1 = 50.e-4;
+  // the physical silicon for lgad.sta
+  const double x0 = 0., y0 = -1.15308e-4;
+  const double x1 = 100.e-4, y1 = 50.5e-4;
+  
 
   // Ey colour map
   TCanvas* c1 = new TCanvas("c1", "Silvaco Ey [V/cm]", 900, 450);
