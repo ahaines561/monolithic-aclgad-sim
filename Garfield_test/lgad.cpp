@@ -5,7 +5,6 @@
 #include <iostream>
 #include <TApplication.h>
 #include <TCanvas.h>
-
 #include "Garfield/ComponentTcad2d.hh"
 #include "Garfield/ComponentConstant.hh"
 #include "Garfield/MediumSilicon.hh"
@@ -20,7 +19,9 @@ using namespace Garfield;
 
 int main(int argc, char* argv[]) {
   const bool doMIP = argc > 2 ? std::atoi(argv[2]) != 0 : true;
+  // argv[3]: impact-ionisation model: vodm (default) | massey | grant | okuto
   const std::string model = argc > 3 ? argv[3] : "vodm";
+  const double xTrackUm = argc > 4 ? std::atof(argv[4]) : 20.;
   const std::string file = argc > 1 ? argv[1]
       : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad.sta";
   int rootArgc = 1;
@@ -33,7 +34,6 @@ int main(int argc, char* argv[]) {
 
   MediumSilicon si;
   si.SetTemperature(293.15);
-  // Impact-ionisation model, selected on the command line
   if (model == "massey") {
     si.SetImpactIonisationModelMassey();
   } else if (model == "grant") {
@@ -52,7 +52,6 @@ int main(int argc, char* argv[]) {
   cmp.SetRangeZ(-5.e-4, 5.e-4);
   cmp.PrintRegions();
 
-  // device geometry
   double bx0 = 0., by0 = 0., bz0 = 0., bx1 = 0., by1 = 0., bz1 = 0.;
   if (!cmp.GetBoundingBox(bx0, by0, bz0, bx1, by1, bz1)) {
     std::cerr << "Could not get the bounding box from the field map;\n"
@@ -62,18 +61,25 @@ int main(int argc, char* argv[]) {
   std::cout << "map extent: x = [" << bx0 * 1.e4 << ", " << bx1 * 1.e4
             << "] um, y = [" << by0 * 1.e4 << ", " << by1 * 1.e4
             << "] um" << std::endl;
-  const double x0 = 0.5 * (bx0 + bx1) + 0.13e-4;
+  double x0 = xTrackUm * 1.e-4 + 0.13e-4;
+  if (x0 <= bx0 || x0 >= bx1) {
+    std::cout << "requested x = " << xTrackUm
+              << " um is outside the map; using the device centre."
+              << std::endl;
+    x0 = 0.5 * (bx0 + bx1) + 0.13e-4;
+  }
+  std::cout << "probe/track line at x = " << x0 * 1.e4 << " um"
+            << std::endl;
 
-  // Scans the full bounding box
   std::cout << "# y[um]   V[V]   Ey[V/cm]\n";
   double eMax = 0., yGain = 0.;
-  double yTop = 1., yBot = -1.; 
+  double yTop = 1., yBot = -1.;
   const int nScan = 400;
   for (int i = 0; i <= nScan; ++i) {
     const double y = by0 + ((by1 - by0) * i) / nScan;
     double ex, ey, ez, v; int st; Medium* m = nullptr;
     cmp.ElectricField(x0, y, 0., ex, ey, ez, v, m, st);
-    if (st != 0) continue;
+    if (st != 0) continue; 
     if (yTop > yBot) yTop = y;
     yBot = y;
     const double e = std::sqrt(ex * ex + ey * ey);
@@ -85,7 +91,7 @@ int main(int argc, char* argv[]) {
               << "check the region/material assignment above.\n";
     return 1;
   }
-  const double d = yBot - yTop;   // drift thickness
+  const double d = yBot - yTop;
   std::cout << "active silicon: y = [" << yTop * 1.e4 << ", "
             << yBot * 1.e4 << "] um (d = " << d * 1.e4 << " um)"
             << std::endl;
@@ -96,24 +102,56 @@ int main(int argc, char* argv[]) {
               << "at this bias." << std::endl;
   }
 
-  // Weighting field pproximation
+  double gMax = eMax, gx = x0, gy = yGain;
+  for (int ix = 0; ix <= 60; ++ix) {
+    const double x = bx0 + ((bx1 - bx0) * ix) / 60. + 0.077e-4;
+    for (int iy = 0; iy <= 150; ++iy) {
+      const double y = by0 + ((by1 - by0) * iy) / 150. + 0.0113e-4;
+      double ex, ey, ez, v; int st; Medium* m = nullptr;
+      cmp.ElectricField(x, y, 0., ex, ey, ez, v, m, st);
+      if (st != 0) continue;
+      const double e = std::sqrt(ex * ex + ey * ey);
+      if (e > gMax) { gMax = e; gx = x; gy = y; }
+    }
+    for (int iy = 0; iy <= 120; ++iy){
+      const double y = yTop - 0.5e-4 + (3.5e-4 * iy) / 120.;
+      double ex, ey, ez, v; int st; Medium* m = nullptr;
+      cmp.ElectricField(x, y, 0., ex, ey, ez, v, m, st);
+      if (st != 0) continue;
+      const double e = std::sqrt(ex * ex + ey * ey);
+      if (e > gMax) { gMax = e; gx = x; gy = y; }
+    }
+  }
+  std::cout << "global max field " << gMax << " V/cm at (x, y) = ("
+            << gx * 1.e4 << ", " << gy * 1.e4 << ") um" << std::endl;
+  if (gMax > 1.2 * eMax) {
+    std::cout << "NOTE: the global maximum exceeds the peak on the "
+              << "configured line. To probe the hot spot instead, pass "
+              << "its x on the command line, e.g.: ./lgad <file> <doMIP> "
+              << "<model> " << gx * 1.e4 << std::endl;
+  }
+
+  //weighting field approx.
   ComponentConstant wcmp;
   wcmp.SetArea(bx0, yTop, -5.e-4, bx1, yBot, 5.e-4);
   wcmp.SetMedium(&si);
   wcmp.SetElectricField(0., 0., 0.);
   wcmp.SetWeightingField(0., 1. / d, 0., "pad");
-  wcmp.SetWeightingPotential(0., 0., 0., 1.);
+  wcmp.SetWeightingPotential(0.5 * (bx0 + bx1), yTop, 0., 1.);
+
+
   {
+    const double yMid = 0.5 * (yTop + yBot);
     double wx = 0., wy = 0., wz = 0.;
-    wcmp.WeightingField(125.e-4, 25.e-4, 0., wx, wy, wz, "pad");
+    wcmp.WeightingField(x0, yMid, 0., wx, wy, wz, "pad");
     std::cout << "Ew at centre = (" << wx << ", " << wy << ", " << wz
-              << ")  [expect (0, 200, 0)]" << std::endl;
+              << ")  [expect (0, " << 1. / d << ", 0)]" << std::endl;
     std::cout << "wpot: top = "
-              << wcmp.WeightingPotential(125.e-4, 0., 0., "pad")
+              << wcmp.WeightingPotential(x0, yTop, 0., "pad")
               << ", mid = "
-              << wcmp.WeightingPotential(125.e-4, 25.e-4, 0., "pad")
+              << wcmp.WeightingPotential(x0, yMid, 0., "pad")
               << ", back = "
-              << wcmp.WeightingPotential(125.e-4, 50.e-4, 0., "pad")
+              << wcmp.WeightingPotential(x0, yBot, 0., "pad")
               << "  [expect 1, 0.5, 0]" << std::endl;
   }
 
@@ -126,11 +164,9 @@ int main(int argc, char* argv[]) {
   AvalancheMC aval;
   aval.SetSensor(&sensor);
   aval.EnableSignalCalculation();
-  // the CMOS-LGAD calibration (arXiv:2505.05974) needed
-  // 0.1 ps steps for TCAD-level gain agreement.
-  aval.SetTimeSteps(2.e-3); // 2 ps
-  // use 5.e-4 or finer for quotable gain number
+  aval.SetTimeSteps(2.e-3); // 2 ps (shape run);
   const std::size_t sizeCap = 20000;
+
   const double yInj = std::min(yGain + 5.e-4, 0.5 * (yGain + yBot));
   AvalancheMC avalLadder;
   avalLadder.SetSensor(&sensor);
@@ -142,9 +178,9 @@ int main(int argc, char* argv[]) {
   std::cout << "# dt[ps]   G_e (mean+-sem, N)      G_eh (mean+-sem, N)\n";
   for (const double dt : steps) {
     avalLadder.SetTimeSteps(dt);
-    double res[2][2] = {{0., 0.}, {0., 0.}};
+    double res[2][2] = {{0., 0.}, {0., 0.}};   // [mode][sum, sum2]
     int nDone[2] = {0, 0};
-    const int nWant[2] = {200, 300};
+    const int nWant[2] = {200, 300};           // high-stat pass
     for (int mode = 0; mode < 2; ++mode) {
       for (int i = 0; i < nWant[mode]; ++i) {
         if (mode == 1 && i % 25 == 0) {
@@ -166,8 +202,8 @@ int main(int argc, char* argv[]) {
           if (ne >= sizeCap) ++nCapped;
         }
       }
-      // Print each mode's result as soon as it completes
-      // wedged avalanche in the other mode cannot hide it
+      // Print each mode's result as soon as it completes, so a
+      // wedged avalanche in the other mode cannot hide it.
       const int n = nDone[mode];
       const double mean = res[mode][0] / n;
       const double var = res[mode][1] / n - mean * mean;
@@ -198,6 +234,8 @@ int main(int argc, char* argv[]) {
   }
 
   if (!doMIP) return 0;
+
+  // MIP
   SolidBox box(0.5 * (bx0 + bx1), 0.5 * (yTop + yBot), 0.,
                0.5 * (bx1 - bx0), 0.5 * d, 5.e-4);
   GeometrySimple geo;
@@ -211,10 +249,10 @@ int main(int argc, char* argv[]) {
   TrackHeed track;
   track.SetSensor(&heedSensor);
   track.SetParticle("pi");
-  track.SetMomentum(180.e9);
+  track.SetMomentum(180.e9); 
   sensor.ClearSignal();
 
-  track.NewTrack(x0, yTop + 0.01e-4, 0., 0., 0., 1., 0.);
+  track.NewTrack(x0, yTop + 0.01e-4, 0., 0., 0., 1., 0.); 
   double xc, yc, zc, tc, ec, extra;
   int nc = 0;
   unsigned long nPrimary = 0, nTotal = 0;
