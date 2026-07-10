@@ -5,6 +5,8 @@
 #include <iostream>
 #include <TApplication.h>
 #include <TCanvas.h>
+#include <TSystem.h>
+
 #include "Garfield/ComponentTcad2d.hh"
 #include "Garfield/ComponentConstant.hh"
 #include "Garfield/MediumSilicon.hh"
@@ -14,6 +16,9 @@
 #include "Garfield/TrackHeed.hh"
 #include "Garfield/AvalancheMC.hh"
 #include "Garfield/ViewSignal.hh"
+#include "Garfield/ViewDrift.hh"
+#include "Garfield/ComponentGrid.hh"
+#include "Garfield/ViewField.hh"
 
 using namespace Garfield;
 
@@ -34,20 +39,20 @@ int main(int argc, char* argv[]) {
 
   MediumSilicon si;
   si.SetTemperature(293.15);
-  if (model == "massey") {
-    si.SetImpactIonisationModelMassey();
-  } else if (model == "grant") {
-    si.SetImpactIonisationModelGrant();
-  } else if (model == "okuto") {
-    si.SetImpactIonisationModelOkutoCrowell();
-  } else {
-    si.SetImpactIonisationModelVanOverstraetenDeMan();
-  }
-  std::cout << "impact-ionisation model: "
-            << (model == "massey" || model == "grant" || model == "okuto"
-                    ? model : "vodm (van Overstraeten-de Man)")
-            << std::endl;
-
+  // if (model == "massey") {
+  //   si.SetImpactIonisationModelMassey();
+  // } else if (model == "grant") {
+  //   si.SetImpactIonisationModelGrant();
+  // } else if (model == "okuto") {
+  //   si.SetImpactIonisationModelOkutoCrowell();
+  // } else {
+  //   si.SetImpactIonisationModelVanOverstraetenDeMan();
+  // }
+  // std::cout << "impact-ionisation model: "
+  //           << (model == "massey" || model == "grant" || model == "okuto"
+  //                   ? model : "vodm (van Overstraeten-de Man)")
+  //           << std::endl;
+  si.SetImpactIonisationModelOkutoCrowell();
   cmp.SetMedium("3", &si);
   cmp.SetRangeZ(-5.e-4, 5.e-4);
   cmp.PrintRegions();
@@ -131,15 +136,13 @@ int main(int argc, char* argv[]) {
               << "<model> " << gx * 1.e4 << std::endl;
   }
 
-  //weighting field approx.
+  // weighting field approx.
   ComponentConstant wcmp;
   wcmp.SetArea(bx0, yTop, -5.e-4, bx1, yBot, 5.e-4);
   wcmp.SetMedium(&si);
   wcmp.SetElectricField(0., 0., 0.);
   wcmp.SetWeightingField(0., 1. / d, 0., "pad");
   wcmp.SetWeightingPotential(0.5 * (bx0 + bx1), yTop, 0., 1.);
-
-
   {
     const double yMid = 0.5 * (yTop + yBot);
     double wx = 0., wy = 0., wz = 0.;
@@ -155,9 +158,37 @@ int main(int argc, char* argv[]) {
               << "  [expect 1, 0.5, 0]" << std::endl;
   }
 
+
+  // // don's weighting field
+  // const std::string weightingfield = argc > 1 ? argv[1]
+  //     : "/home/ahaines561/HEP/MAS/Silvaco_dat/garfield_lgad_weightingfield.txt";
+
+  // ComponentGrid wpad;
+  // wpad.SetCartesianCoordinates();
+  // wpad.GetBoundingBox(bx0, by0, bz0, bx1, by1, bz1);
+  // bool ok = wpad.LoadWeightingField(weightingfield, "xyz", "pad");
+  // if (!ok) {
+  //   std::cout << "Failed to Load weighting field" << std::endl;
+  // }
+  // {
+  //   const double yMid = 0.5 * (yTop + yBot);
+  //   double wfx = 0., wfy = 0., wfz = 0.;
+  //   wpad.WeightingField(x0, yMid, 0., wfx, wfy, wfz, "pad");
+  //   std::cout << "Ew at centre = (" << wfx << ", " << wfy << ", " << wfz
+  //             << ")  [expect (0, " << 1. / d << ", 0)]" << std::endl;
+  //   std::cout << "wpot: top = "
+  //             << wpad.WeightingPotential(x0, yTop, 0., "pad")
+  //             << ", mid = "
+  //             << wpad.WeightingPotential(x0, yMid, 0., "pad")
+  //             << ", back = "
+  //             << wpad.WeightingPotential(x0, yBot, 0., "pad")
+  //             << "  [expect 1, 0.5, 0]" << std::endl;
+  // }
+
   Sensor sensor;
   sensor.AddComponent(&cmp);
   sensor.AddElectrode(&wcmp, "pad");
+  // sensor.AddElectrode(&wpad, "pad");
   sensor.SetTimeWindow(0., 0.005, 800);
   sensor.SetArea(bx0, yTop + 0.02e-4, -5.e-4, bx1, yBot - 0.5e-4, 5.e-4);
 
@@ -166,6 +197,16 @@ int main(int argc, char* argv[]) {
   aval.EnableSignalCalculation();
   aval.SetTimeSteps(2.e-3); // 2 ps (shape run);
   const std::size_t sizeCap = 20000;
+
+  ViewDrift driftView;
+  driftView.SetArea(bx0, yTop, -5.e-4, bx1, yBot, 5.e-4);
+  aval.EnablePlotting(&driftView);
+
+  // ViewField wfieldView;
+  // wfieldView.SetComponent(&wpad);
+  // wfieldView.SetArea(0., -4e-4, 0., 250.e-4, 50.e-4, 0.);
+  // wfieldView.SetComponent(&wcmp);
+  // wfieldView.SetArea(0., -1.15308e-4, 0., 100.e-4, 50.e-4, 0.);
 
   const double yInj = std::min(yGain + 5.e-4, 0.5 * (yGain + yBot));
   AvalancheMC avalLadder;
@@ -284,11 +325,51 @@ int main(int argc, char* argv[]) {
   std::cout << "signal check: peak bin = " << iMax
             << ", integral (arb.) = " << qInt << std::endl;
 
+  driftView.Plot2d();
+
   TCanvas c("c", "", 800, 600);
   ViewSignal vs;
   vs.SetSensor(&sensor);
   vs.SetCanvas(&c);
   vs.PlotSignal("pad");
   c.SaveAs("signal_pad.pdf");
-  app.Run(true);
+
+  double t0 = 0.;
+  double dt = 0.05;
+  TCanvas canvas("c", "", 1400, 600);
+  canvas.Divide(2, 1);
+  auto pad1 = canvas.cd(1);
+  auto pad2 = canvas.cd(2);
+  driftView.SetCanvas((TPad*)canvas.cd(1));
+  vs.SetCanvas((TPad*)canvas.cd(2));
+
+  const std::size_t nFrames = 120;
+  for (std::size_t i = 0; i < 120; ++i) {
+    driftView.Clear();
+    aval.SetTimeWindow(t0, t0 + dt);
+    aval.ResumeAvalanche();
+    driftView.Plot2d(true, true);
+    vs.PlotSignal("pad");
+    gSystem->ProcessEvents();
+    constexpr bool gif = true;
+    if (!gif) {
+      char filename[50];
+      snprintf(filename, 50, "frames/frame_%03zu.png", i);
+      canvas.SaveAs(filename);
+    } else {
+      if (i == nFrames - 1) {
+        canvas.Print("planar_movie.gif++");
+      } else {
+        canvas.Print("planar_movie.gif+3");
+      }
+    }
+    t0 += dt;
+  }
+  std::cout << "Done.\n";
+  
+  // TCanvas b("b", "", 800, 600);
+  // wfieldView.PlotContourWeightingField("strip", "v");
+  // b.SaveAs("weighting_field.pdf");
+
+  app.Run();
 }
