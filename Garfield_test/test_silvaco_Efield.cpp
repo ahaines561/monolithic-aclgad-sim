@@ -16,7 +16,9 @@ int main(int argc, char* argv[]) {
   const std::string file =
       argc > 1 ? argv[1]
                : "/home/ahaines561/HEP/MAS/Silvaco_dat/"
-                 "lgad.sta";
+                //  "lgad180V.sta";
+                "lgad150V.sta";
+                //  "diode.sta";
 
   ComponentTcad2d cmp;
   cmp.InitialiseSilvaco(file);
@@ -31,7 +33,6 @@ int main(int argc, char* argv[]) {
   // the physical silicon for lgad.sta
   const double x0 = 0., y0 = -1.15308e-4;
   const double x1 = 100.e-4, y1 = 50.5e-4;
-  
 
   // Ey colour map
   TCanvas* c1 = new TCanvas("c1", "Silvaco Ey [V/cm]", 900, 450);
@@ -50,6 +51,7 @@ int main(int argc, char* argv[]) {
   fEm.SetCanvas(c2);
   fEm.SetArea(x0, y0, x1, y1);
   fEm.SetNumberOfSamples2d(400, 200);
+  fEm.SetElectricFieldRange(0., 1.e5);
   fEm.Plot("e", "colz");
   c2->Update();
 

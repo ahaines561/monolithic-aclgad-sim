@@ -6,6 +6,7 @@
 #include <iterator>
 #include <chrono>
 #include <atomic>
+#include <algorithm>
 #include <iostream>
 #include <TApplication.h>
 #include <TCanvas.h>
@@ -35,10 +36,17 @@ int main(int argc, char* argv[]) {
   const auto tRunStart = Clock::now();
   const bool doMIP = argc > 2 ? std::atoi(argv[2]) != 0 : true;
   // argv[3]: impact-ionisation model: vodm (default) | massey | grant | okuto
-  const std::string model = argc > 3 ? argv[3] : "vodm";
+  const std::string model = argc > 3 ? argv[3] : "okuto";
   const double xTrackUm = argc > 4 ? std::atof(argv[4]) : 20.;
+  // argv[5]: bias label for batch scans (e.g. "190"), written into
+  // results.csv and per-model size-file names. Purely a label -- the
+  // actual bias is whatever the .sta file was solved at.
+  const std::string biasLabel = argc > 5 ? argv[5] : "NA";
   const std::string file = argc > 1 ? argv[1]
-      : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad.sta";
+      : "/home/ahaines561/HEP/MAS/Silvaco_dat"
+      // "/lgad.sta";
+      // "/lgad180V.sta";
+      "/lgad150V.sta";
   int rootArgc = 1;
   char* rootArgv[] = {argv[0], nullptr};
   TApplication app("app", &rootArgc, rootArgv);
@@ -46,8 +54,10 @@ int main(int argc, char* argv[]) {
 
   ComponentTcad2d cmp;
   if (!cmp.InitialiseSilvaco(file)) return 1;
-
   MediumSilicon si;
+  // Canali model should be default, but set it explicitly
+  si.SetSaturationVelocityModelCanali();
+  si.SetDopingMobilityModelMasetti();
   si.SetTemperature(293.15);
   // gain is very sensitive to the ionisation model at these fields
   if (model == "massey") {
@@ -180,6 +190,102 @@ int main(int argc, char* argv[]) {
               << "<model> " << gx * 1.e4 << std::endl;
   }
 
+  // field dump over x = xTrack +- 5 um, full depth, for offline plotting
+  {
+    const auto tDumpStart = Clock::now();
+    const double xLo = std::max(bx0, (xTrackUm - 5.) * 1.e-4);
+    const double xHi = std::min(bx1, (xTrackUm + 5.) * 1.e-4);
+    const double dxCm = 0.1e-4;
+    const double dyCm = 0.05e-4; 
+    const double eps = 0.013e-4;
+    std::ofstream fdump("efield_window.csv");
+    fdump << "x_um,y_um,Ex_Vcm,Ey_Vcm,Emag_Vcm,V\n";
+    std::size_t nRows = 0, nBad = 0;
+    double wMax = 0., wMaxX = 0., wMaxY = 0.;
+    for (double x = xLo + eps; x <= xHi; x += dxCm) {
+      for (double y = by0; y <= by1; y += dyCm) {
+        double ex, ey, ez, v; int st; Medium* m = nullptr;
+        cmp.ElectricField(x, y, 0., ex, ey, ez, v, m, st);
+        if (st != 0) { ++nBad; continue; }
+        const double e = std::sqrt(ex * ex + ey * ey);
+        if (e > wMax) { wMax = e; wMaxX = x; wMaxY = y; }
+        fdump << x * 1.e4 << "," << y * 1.e4 << "," << ex << "," << ey
+              << "," << e << "," << v << "\n";
+        ++nRows;
+      }
+    }
+    std::cout << "field dump: x = [" << xLo * 1.e4 << ", " << xHi * 1.e4
+              << "] um -> efield_window.csv (" << nRows << " points, "
+              << nBad << " invalid skipped)" << std::endl;
+    std::cout << "  window max |E| = " << wMax << " V/cm at (x, y) = ("
+              << wMaxX * 1.e4 << ", " << wMaxY * 1.e4 << ") um"
+              << std::endl;
+    std::cout << "[timer] field dump: " << ElapsedS(tDumpStart) << " s"
+              << std::endl;
+  }
+
+  {
+    const auto tFullStart = Clock::now();
+    const int nxFull = 250, nyFull = 250;
+    const double eps = 0.013e-4;
+    std::ofstream ffull("efield_full.csv");
+    ffull << "x_um,y_um,Ex_Vcm,Ey_Vcm,Emag_Vcm,V\n";
+    std::size_t nRows = 0, nBad = 0;
+    for (int ix = 0; ix <= nxFull; ++ix) {
+      const double x = bx0 + (bx1 - bx0) * ix / nxFull + eps;
+      for (int iy = 0; iy <= nyFull; ++iy) {
+        const double y = by0 + (by1 - by0) * iy / nyFull;
+        double ex, ey, ez, v; int st; Medium* m = nullptr;
+        cmp.ElectricField(x, y, 0., ex, ey, ez, v, m, st);
+        if (st != 0) { ++nBad; continue; }
+        const double e = std::sqrt(ex * ex + ey * ey);
+        ffull << x * 1.e4 << "," << y * 1.e4 << "," << ex << "," << ey
+              << "," << e << "," << v << "\n";
+        ++nRows;
+      }
+    }
+    std::cout << "full-device dump -> efield_full.csv (" << nRows
+              << " points, " << nBad << " invalid skipped)" << std::endl;
+    std::cout << "[timer] full-device dump: " << ElapsedS(tFullStart)
+              << " s" << std::endl;
+  }
+
+  {
+    const auto tHeedStart = Clock::now();
+    SolidBox hbox(0.5 * (bx0 + bx1), 0.5 * (yTop + yBot), 0.,
+                  0.5 * (bx1 - bx0), 0.5 * d, 5.e-4);
+    GeometrySimple hgeo;
+    hgeo.AddSolid(&hbox, &si);
+    ComponentConstant hcmp;
+    hcmp.SetGeometry(&hgeo);
+    hcmp.SetElectricField(0., 100., 0.);
+    Sensor hsensor;
+    hsensor.AddComponent(&hcmp);
+    TrackHeed htrack;
+    htrack.SetSensor(&hsensor);
+    htrack.SetParticle("pi");
+    htrack.SetMomentum(180.e9);
+    const int nHeedTracks = 300;
+    std::ofstream fprim(biasLabel == "NA" ? "primary_pairs.txt"
+        : ("primary_pairs_" + biasLabel + "V.txt"));
+    for (int it = 0; it < nHeedTracks; ++it) {
+      htrack.NewTrack(x0, yTop + 0.01e-4, 0., 0., 0., 1., 0.);
+      double xc, yc, zc, tc, ec, extra;
+      int nc = 0;
+      unsigned long nPrimary = 0;
+      while (htrack.GetCluster(xc, yc, zc, tc, nc, ec, extra)) {
+        nPrimary += nc;
+      }
+      fprim << nPrimary << "\n";
+    }
+    std::cout << "wrote " << nHeedTracks << " fast Heed tracks (primary "
+              << "pairs only, no avalanche) to primary_pairs"
+              << (biasLabel == "NA" ? "" : "_" + biasLabel + "V")
+              << ".txt" << std::endl;
+    std::cout << "[timer] Heed primary-statistics: "
+              << ElapsedS(tHeedStart) << " s" << std::endl;
+  }
+
   // weighting field approx.
   ComponentConstant wcmp;
   wcmp.SetArea(bx0, yTop, -5.e-4, bx1, yBot, 5.e-4);
@@ -211,12 +317,10 @@ int main(int argc, char* argv[]) {
 
   // gain layer is ~0.5 um wide -- time steps under-resolved it, use distance steps
   // fine steps only pay off in the gain region; coarse in bulk (~50x faster)
-  double kDistanceStepCm = 1.e-6;  // 10 nm placeholder; confirm via ladder below
-  const double bulkStepCm = 2.5e-5;  // 250 nm, no multiplication out there
+  double kDistanceStepCm = 2.e-6;
+  const double bulkStepCm = 2.5e-5;
   const double yFine = yGain + 2.5e-4;
-  // diagnostic: verify the step-function args really are (x, y, z) in cm,
-  // and see how many calls actually land in the fine vs coarse branch.
-  // atomic because both AvalancheMC objects have multithreading enabled.
+  //verify the step-function args really are (x, y, z) in cm,
   std::atomic<long long> avalFnCalls{0}, avalFnFine{0}, avalFnCoarse{0},
       avalFnPrinted{0};
   AvalancheMC aval;
@@ -236,7 +340,7 @@ int main(int argc, char* argv[]) {
     ++avalFnCoarse;
     return bulkStepCm;
   });
-  const std::size_t sizeCap = 20000;
+  const std::size_t sizeCap = 5000;
 
   ViewDrift driftView;
   driftView.SetArea(bx0, yTop, -5.e-4, bx1, yBot, 5.e-4);
@@ -258,7 +362,7 @@ int main(int argc, char* argv[]) {
   avalLadder.EnableAvalancheSizeLimit(ladderCap);
   aval.EnableAvalancheSizeLimit(sizeCap);
   // convergence scan of the gain-region step; bulk step stays at bulkStepCm
-  double ladderStepCm = 1.e-5;
+  double ladderStepCm = 2.e-6;  // 20 nm production step (from convergence scan)
   avalLadder.SetStepDistanceFunction(
       [&ladderStepCm, yFine, bulkStepCm, &ladderFnCalls, &ladderFnFine,
        &ladderFnCoarse, &ladderFnPrinted](double x, double y, double z) {
@@ -271,6 +375,7 @@ int main(int argc, char* argv[]) {
         ++ladderFnCoarse;
         return bulkStepCm;
       });
+#if 0  // convergence scan (retired): G_eh plateau from 50 nm down; 20 nm adopted
   // convergence scan: pick the coarsest step where G stops changing
   const double distanceStepsCm[] = {1.e-5, 5.e-6, 2.e-6, 1.e-6, 5.e-7};
   std::vector<std::size_t> sizes;      // pooled only from the finest step
@@ -372,6 +477,153 @@ int main(int argc, char* argv[]) {
     std::cout << "avalanche sizes (finest step only) written to "
               << "eh_sizes.txt" << std::endl;
   }
+#endif
+
+  // model comparison at the production step, same field map + injection points
+  const char* cmpModels[] = {"vodm", "okuto", "massey", "grant"};
+  const int nCmpModels = 4;
+  struct ModelResult {
+    double ge = 0., geSem = 0., geh = 0., gehSem = 0., F = 0., med = 0.;
+    int nCapEh = 0, nEh = 0;
+    bool divergent = false;
+  } cmpRes[4];
+  const auto tCmpStart = Clock::now();
+  std::cout << "# model comparison: fine step = " << ladderStepCm * 1.e7
+            << " nm, bulk step = " << bulkStepCm * 1.e7 << " nm, cap = "
+            << ladderCap << std::endl;
+  for (int im = 0; im < nCmpModels; ++im) {
+    const std::string m = cmpModels[im];
+    if (m == "massey") {
+      si.SetImpactIonisationModelMassey();
+    } else if (m == "okuto") {
+      si.SetImpactIonisationModelOkutoCrowell();
+    } else if (m == "grant") {
+      si.SetImpactIonisationModelGrant();
+    } else {
+      si.SetImpactIonisationModelVanOverstraetenDeMan();
+    }
+    ModelResult& r = cmpRes[im];
+    // G_e: single-pass electron gain (no hole transport, always finite)
+    const auto tGeStart = Clock::now();
+    double sum = 0., sum2 = 0.;
+    const int nWantE = 200;
+    for (int i = 0; i < nWantE; ++i) {
+      const double xi = x0 + (i % 5 - 2) * 2.e-4;
+      avalLadder.AvalancheElectron(xi, yInj, 0., 0.);
+      std::size_t ne = 0, ni = 0;
+      avalLadder.GetAvalancheSize(ne, ni);
+      sum += ne;
+      sum2 += double(ne) * double(ne);
+    }
+    r.ge = sum / nWantE;
+    {
+      const double var = sum2 / nWantE - r.ge * r.ge;
+      r.geSem = std::sqrt(var > 0. ? var / nWantE : 0.);
+    }
+    std::cout << m << "   G_e  = " << r.ge << " +- " << r.geSem
+              << " (N=" << nWantE << ")  [timer] "
+              << ElapsedS(tGeStart) << " s" << std::endl;
+    // G_eh: full gain with hole feedback; diverges if f >= 1
+    const auto tEhStart = Clock::now();
+    sum = 0.;
+    sum2 = 0.;
+    std::vector<std::size_t> mSizes;
+    const int nWantEh = 300;
+    for (int i = 0; i < nWantEh; ++i) {
+      if (i % 50 == 0) std::cout << "  e+h injection " << i << std::endl;
+      const double xi = x0 + (i % 5 - 2) * 2.e-4;
+      avalLadder.AvalancheElectronHole(xi, yInj, 0., 0.);
+      std::size_t ne = 0, ni = 0;
+      avalLadder.GetAvalancheSize(ne, ni);
+      sum += ne;
+      sum2 += double(ne) * double(ne);
+      mSizes.push_back(ne);
+      if (ne >= ladderCap) ++r.nCapEh;
+      // early exit: 50 events in, >10% capped -> feedback divergence
+      if (i == 49 && r.nCapEh > 5) {
+        r.divergent = true;
+        std::cout << m << ": " << r.nCapEh << "/50 e+h avalanches hit the "
+                  << "cap -- hole-feedback divergence (f >= 1) at this "
+                  << "bias; G_eh undefined, aborting this model's e+h "
+                  << "pass." << std::endl;
+        break;
+      }
+    }
+    r.nEh = int(mSizes.size());
+    r.geh = sum / r.nEh;
+    {
+      const double var = sum2 / r.nEh - r.geh * r.geh;
+      r.gehSem = std::sqrt(var > 0. ? var / r.nEh : 0.);
+    }
+    {
+      double m1 = 0., m2 = 0.;
+      for (const auto s : mSizes) { m1 += s; m2 += double(s) * double(s); }
+      m1 /= r.nEh;
+      m2 /= r.nEh;
+      r.F = m1 > 0. ? m2 / (m1 * m1) : 0.;
+      std::vector<std::size_t> tmp(mSizes);
+      std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+      r.med = double(tmp[tmp.size() / 2]);
+    }
+    if (!r.divergent && r.nCapEh * 10 > r.nEh) r.divergent = true;
+    std::cout << m << "   G_eh = " << r.geh << " +- " << r.gehSem
+              << " (N=" << r.nEh << ", median=" << r.med << ", capped="
+              << r.nCapEh << (r.divergent ? ", DIVERGENT" : "")
+              << ")   F = " << r.F << "  [timer] " << ElapsedS(tEhStart)
+              << " s" << std::endl;
+    std::ofstream fs(biasLabel == "NA" ? ("eh_sizes_" + m + ".txt")
+                                        : ("eh_sizes_" + m + "_" + biasLabel
+                                           + "V.txt"));
+    for (const auto s : mSizes) fs << s << "\n";
+  }
+  std::cout << "[stepfn ladder] calls=" << ladderFnCalls.load()
+            << " fine=" << ladderFnFine.load() << " coarse="
+            << ladderFnCoarse.load() << std::endl;
+  std::cout << "[timer] model comparison: " << ElapsedS(tCmpStart)
+            << " s" << std::endl;
+  std::cout << "\n# model   G_e            G_eh             median   F"
+            << "      status" << std::endl;
+  for (int im = 0; im < nCmpModels; ++im) {
+    const ModelResult& r = cmpRes[im];
+    std::cout << cmpModels[im] << "   " << r.ge << " +- " << r.geSem
+              << "   " << r.geh << " +- " << r.gehSem << "   " << r.med
+              << "   " << r.F << "   "
+              << (r.divergent ? "DIVERGENT (G_eh unreliable)" : "ok")
+              << std::endl;
+  }
+
+  // append one row per model to results.csv for the bias/model scan;
+  // header written only if the file doesn't already exist
+  {
+    std::ifstream ftest("results.csv");
+    const bool exists = ftest.good();
+    ftest.close();
+    std::ofstream fres("results.csv", std::ios::app);
+    if (!exists) {
+      fres << "bias,model,Epeak_line_Vcm,Epeak_global_Vcm,Ge,GeSem,Geh,"
+           << "GehSem,median,F,nCapEh,N,divergent\n";
+    }
+    for (int im = 0; im < nCmpModels; ++im) {
+      const ModelResult& r = cmpRes[im];
+      fres << biasLabel << "," << cmpModels[im] << "," << eMax << ","
+           << gMax << "," << r.ge << "," << r.geSem << "," << r.geh << ","
+           << r.gehSem << "," << r.med << "," << r.F << "," << r.nCapEh
+           << "," << r.nEh << "," << (r.divergent ? 1 : 0) << "\n";
+    }
+    std::cout << "appended " << nCmpModels << " rows to results.csv "
+              << "(bias=" << biasLabel << ")" << std::endl;
+  }
+
+  // restore the CLI-selected model for the MIP section
+  if (model == "massey") {
+    si.SetImpactIonisationModelMassey();
+  } else if (model == "grant") {
+    si.SetImpactIonisationModelGrant();
+  } else if (model == "okuto") {
+    si.SetImpactIonisationModelOkutoCrowell();
+  } else {
+    si.SetImpactIonisationModelVanOverstraetenDeMan();
+  }
 
   if (!doMIP) return 0;
 
@@ -396,7 +648,7 @@ int main(int argc, char* argv[]) {
   double xc, yc, zc, tc, ec, extra;
   int nc = 0;
   unsigned long nPrimary = 0, nTotal = 0;
-  unsigned long ncl = 0;
+  unsigned long ncl = 0, nPairsDone = 0;
   double yLast = 0.;
   // save primaries to replay with multiplication off (no-gain reference)
   std::vector<std::array<double, 4>> primaries;  // {x, y, z, t}
@@ -411,6 +663,12 @@ int main(int argc, char* argv[]) {
       std::size_t ne = 0, ni = 0;
       aval.GetAvalancheSize(ne, ni);
       nTotal += ne;
+      // pair-level progress: clusters alone can hide long silent gaps,
+      // since a single cluster's primary count varies widely (delta rays)
+      if (++nPairsDone % 200 == 0) {
+        std::cout << "  pair " << nPairsDone << "  ["
+                  << ElapsedS(tMipOnStart) << " s elapsed]" << std::endl;
+      }
     }
   }
   std::cout << "MIP: " << ncl << " clusters, last at y = "
