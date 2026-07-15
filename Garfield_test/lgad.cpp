@@ -7,6 +7,11 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <filesystem>
+#include <regex>
+#include <limits>
+#include <sstream>
+#include <iomanip>
 #include <iostream>
 #include <TApplication.h>
 #include <TCanvas.h>
@@ -27,9 +32,44 @@
 using namespace Garfield;
 using Clock = std::chrono::steady_clock;
 
-// diagnostic: seconds since t0, for per-stage wall-clock timing
 double ElapsedS(const Clock::time_point& t0) {
   return std::chrono::duration<double>(Clock::now() - t0).count();
+}
+
+// pulls e.g. 190 out of ".../lgad190V.sta" or "lgad_190V.sta"
+double ParseBiasFromFilename(const std::string& path) {
+  const auto slash = path.find_last_of("/\\");
+  const std::string base = slash == std::string::npos
+      ? path : path.substr(slash + 1);
+  static const std::regex re(R"(([0-9]+(?:\.[0-9]+)?)V)");
+  std::smatch m;
+  if (std::regex_search(base, m, re)) {
+    return std::atof(m[1].str().c_str());
+  }
+  return std::numeric_limits<double>::quiet_NaN();
+}
+
+// "NA" if unparsed; whole numbers print without a decimal point
+std::string FormatBias(double v) {
+  if (std::isnan(v)) return "NA";
+  std::ostringstream oss;
+  if (v == std::floor(v)) {
+    oss << static_cast<long long>(v);
+  } else {
+    oss << std::defaultfloat << std::setprecision(6) << v;
+  }
+  return oss.str();
+}
+
+double MedianOf(std::vector<std::size_t> v) {
+  if (v.empty()) return 0.;
+  const std::size_t n = v.size();
+  std::nth_element(v.begin(), v.begin() + n / 2, v.end());
+  const double hi = double(v[n / 2]);
+  if (n % 2 == 1) return hi;
+  std::nth_element(v.begin(), v.begin() + n / 2 - 1, v.begin() + n / 2);
+  const double lo = double(v[n / 2 - 1]);
+  return 0.5 * (lo + hi);
 }
 
 int main(int argc, char* argv[]) {
@@ -38,15 +78,23 @@ int main(int argc, char* argv[]) {
   // argv[3]: impact-ionisation model: vodm (default) | massey | grant | okuto
   const std::string model = argc > 3 ? argv[3] : "okuto";
   const double xTrackUm = argc > 4 ? std::atof(argv[4]) : 20.;
-  // argv[5]: bias label for batch scans (e.g. "190"), written into
-  // results.csv and per-model size-file names. Purely a label -- the
-  // actual bias is whatever the .sta file was solved at.
-  const std::string biasLabel = argc > 5 ? argv[5] : "NA";
+  const bool display = argc > 6 ? std::atoi(argv[6]) != 0 : false;
   const std::string file = argc > 1 ? argv[1]
-      : "/home/ahaines561/HEP/MAS/Silvaco_dat"
-      // "/lgad.sta";
-      // "/lgad180V.sta";
-      "/lgad150V.sta";
+      : "/home/ahaines561/HEP/MAS/Silvaco_dat/"
+      // "lgad190V.sta";
+      // "lgad180V.sta";
+      "lgad150V.sta";
+  double biasV = (argc > 5 && std::string(argv[5]) != "NA")
+      ? std::atof(argv[5]) : std::numeric_limits<double>::quiet_NaN();
+  if (std::isnan(biasV)) biasV = ParseBiasFromFilename(file);
+  const std::string biasLabel = FormatBias(biasV);
+
+  const std::string outDir = "output_files/";
+  std::filesystem::create_directories(outDir);
+  std::cout << "bias = " << biasLabel
+            << (std::isnan(biasV) ? "" : " V")
+            << ", output directory = " << outDir << std::endl;
+
   int rootArgc = 1;
   char* rootArgv[] = {argv[0], nullptr};
   TApplication app("app", &rootArgc, rootArgv);
@@ -54,10 +102,8 @@ int main(int argc, char* argv[]) {
 
   ComponentTcad2d cmp;
   if (!cmp.InitialiseSilvaco(file)) return 1;
+
   MediumSilicon si;
-  // Canali model should be default, but set it explicitly
-  si.SetSaturationVelocityModelCanali();
-  si.SetDopingMobilityModelMasetti();
   si.SetTemperature(293.15);
   // gain is very sensitive to the ionisation model at these fields
   if (model == "massey") {
@@ -91,7 +137,7 @@ int main(int argc, char* argv[]) {
   const auto tValidStart = Clock::now();
   {
     const int nx = 400, ny = 400;
-    std::ofstream fvalid("validity_map.csv");
+    std::ofstream fvalid(outDir + "validity_map.csv");
     fvalid << "x_um,y_um,status\n";
     std::size_t nInvalid = 0, nScanned = 0;
     for (int ix = 0; ix <= nx; ++ix) {
@@ -128,6 +174,9 @@ int main(int argc, char* argv[]) {
             << std::endl;
 
   std::cout << "# y[um]   V[V]   Ey[V/cm]\n";
+  std::ofstream fprof(outDir + (biasLabel == "NA" ? "profile.csv"
+      : ("profile_" + biasLabel + "V.csv")));
+  fprof << "y_um,V,Ex_Vcm,Ey_Vcm,Emag_Vcm\n";
   double eMax = 0., yGain = 0.;
   double yTop = 1., yBot = -1.;
   const int nScan = 400;
@@ -141,7 +190,10 @@ int main(int argc, char* argv[]) {
     const double e = std::sqrt(ex * ex + ey * ey);
     if (e > eMax) { eMax = e; yGain = y; }
     std::cout << y * 1.e4 << "  " << v << "  " << ey << "\n";
+    fprof << y * 1.e4 << "," << v << "," << ex << "," << ey << ","
+          << e << "\n";
   }
+  fprof.close();
   if (yTop > yBot) {
     std::cerr << "No valid drift medium found along the scan line --\n"
               << "check the region/material assignment above.\n";
@@ -195,10 +247,10 @@ int main(int argc, char* argv[]) {
     const auto tDumpStart = Clock::now();
     const double xLo = std::max(bx0, (xTrackUm - 5.) * 1.e-4);
     const double xHi = std::min(bx1, (xTrackUm + 5.) * 1.e-4);
-    const double dxCm = 0.1e-4;
-    const double dyCm = 0.05e-4; 
-    const double eps = 0.013e-4;
-    std::ofstream fdump("efield_window.csv");
+    const double dxCm = 0.1e-4;    // 0.1 um columns
+    const double dyCm = 0.05e-4;   // 0.05 um rows (resolves the gain layer)
+    const double eps = 0.013e-4;   // dodge exact mesh columns (lookup bug)
+    std::ofstream fdump(outDir + "efield_window.csv");
     fdump << "x_um,y_um,Ex_Vcm,Ey_Vcm,Emag_Vcm,V\n";
     std::size_t nRows = 0, nBad = 0;
     double wMax = 0., wMaxX = 0., wMaxY = 0.;
@@ -228,7 +280,7 @@ int main(int argc, char* argv[]) {
     const auto tFullStart = Clock::now();
     const int nxFull = 250, nyFull = 250;
     const double eps = 0.013e-4;
-    std::ofstream ffull("efield_full.csv");
+    std::ofstream ffull(outDir + "efield_full.csv");
     ffull << "x_um,y_um,Ex_Vcm,Ey_Vcm,Emag_Vcm,V\n";
     std::size_t nRows = 0, nBad = 0;
     for (int ix = 0; ix <= nxFull; ++ix) {
@@ -249,7 +301,6 @@ int main(int argc, char* argv[]) {
     std::cout << "[timer] full-device dump: " << ElapsedS(tFullStart)
               << " s" << std::endl;
   }
-
   {
     const auto tHeedStart = Clock::now();
     SolidBox hbox(0.5 * (bx0 + bx1), 0.5 * (yTop + yBot), 0.,
@@ -266,10 +317,10 @@ int main(int argc, char* argv[]) {
     htrack.SetParticle("pi");
     htrack.SetMomentum(180.e9);
     const int nHeedTracks = 300;
-    std::ofstream fprim(biasLabel == "NA" ? "primary_pairs.txt"
-        : ("primary_pairs_" + biasLabel + "V.txt"));
+    std::ofstream fprim(outDir + (biasLabel == "NA" ? "primary_pairs.txt"
+        : ("primary_pairs_" + biasLabel + "V.txt")));
     for (int it = 0; it < nHeedTracks; ++it) {
-      htrack.NewTrack(x0, yTop + 0.01e-4, 0., 0., 0., 1., 0.);
+      htrack.NewTrack(x0, yTop + 0.03e-4, 0., 0., 0., 1., 0.);
       double xc, yc, zc, tc, ec, extra;
       int nc = 0;
       unsigned long nPrimary = 0;
@@ -317,10 +368,12 @@ int main(int argc, char* argv[]) {
 
   // gain layer is ~0.5 um wide -- time steps under-resolved it, use distance steps
   // fine steps only pay off in the gain region; coarse in bulk (~50x faster)
-  double kDistanceStepCm = 2.e-6;
-  const double bulkStepCm = 2.5e-5;
+  double kDistanceStepCm = 2.e-6;  // 20 nm; convergence scan showed plateau from 50 nm
+  const double bulkStepCm = 2.5e-5;  // 250 nm, no multiplication out there
   const double yFine = yGain + 2.5e-4;
-  //verify the step-function args really are (x, y, z) in cm,
+  // diagnostic: verify the step-function args really are (x, y, z) in cm,
+  // and see how many calls actually land in the fine vs coarse branch.
+  // atomic because both AvalancheMC objects have multithreading enabled.
   std::atomic<long long> avalFnCalls{0}, avalFnFine{0}, avalFnCoarse{0},
       avalFnPrinted{0};
   AvalancheMC aval;
@@ -340,11 +393,11 @@ int main(int argc, char* argv[]) {
     ++avalFnCoarse;
     return bulkStepCm;
   });
-  const std::size_t sizeCap = 5000;
+  const std::size_t sizeCap = 5000;  // was 20000; bounds cost per pair
 
   ViewDrift driftView;
   driftView.SetArea(bx0, yTop, -5.e-4, bx1, yBot, 5.e-4);
-  aval.EnablePlotting(&driftView);
+  if (display) aval.EnablePlotting(&driftView);
 
   // ViewField wfieldView;
   // wfieldView.SetComponent(&wcmp);
@@ -472,7 +525,7 @@ int main(int argc, char* argv[]) {
               << "  (McIntyre low-k limit -> F -> 1; large F/heavy tail "
               << "suggests operation near the breakdown knee)"
               << std::endl;
-    std::ofstream fs("eh_sizes.txt");
+    std::ofstream fs(outDir + "eh_sizes.txt");
     for (const auto s : sizes) fs << s << "\n";
     std::cout << "avalanche sizes (finest step only) written to "
               << "eh_sizes.txt" << std::endl;
@@ -483,7 +536,8 @@ int main(int argc, char* argv[]) {
   const char* cmpModels[] = {"vodm", "okuto", "massey", "grant"};
   const int nCmpModels = 4;
   struct ModelResult {
-    double ge = 0., geSem = 0., geh = 0., gehSem = 0., F = 0., med = 0.;
+    double ge = 0., geSem = 0., geMed = 0., geh = 0., gehSem = 0., F = 0.,
+           med = 0.;
     int nCapEh = 0, nEh = 0;
     bool divergent = false;
   } cmpRes[4];
@@ -507,6 +561,7 @@ int main(int argc, char* argv[]) {
     const auto tGeStart = Clock::now();
     double sum = 0., sum2 = 0.;
     const int nWantE = 200;
+    std::vector<std::size_t> geSizes;
     for (int i = 0; i < nWantE; ++i) {
       const double xi = x0 + (i % 5 - 2) * 2.e-4;
       avalLadder.AvalancheElectron(xi, yInj, 0., 0.);
@@ -514,14 +569,16 @@ int main(int argc, char* argv[]) {
       avalLadder.GetAvalancheSize(ne, ni);
       sum += ne;
       sum2 += double(ne) * double(ne);
+      geSizes.push_back(ne);
     }
     r.ge = sum / nWantE;
     {
       const double var = sum2 / nWantE - r.ge * r.ge;
       r.geSem = std::sqrt(var > 0. ? var / nWantE : 0.);
     }
+    r.geMed = MedianOf(geSizes);
     std::cout << m << "   G_e  = " << r.ge << " +- " << r.geSem
-              << " (N=" << nWantE << ")  [timer] "
+              << " (N=" << nWantE << ", median=" << r.geMed << ")  [timer] "
               << ElapsedS(tGeStart) << " s" << std::endl;
     // G_eh: full gain with hole feedback; diverges if f >= 1
     const auto tEhStart = Clock::now();
@@ -539,13 +596,18 @@ int main(int argc, char* argv[]) {
       sum2 += double(ne) * double(ne);
       mSizes.push_back(ne);
       if (ne >= ladderCap) ++r.nCapEh;
-      // early exit: 50 events in, >10% capped -> feedback divergence
-      if (i == 49 && r.nCapEh > 5) {
+      // divergence aborts: hard trip on sustained capping (6+ caps at
+      // >20% running fraction -- catches grant within ~10 events instead
+      // of paying for 32 cap-sized avalanches); soft trip at event 50 for
+      // >10% (backstop; leaves vodm's legitimate ~8% rate alone)
+      const bool hardTrip = r.nCapEh >= 6 && r.nCapEh * 5 > i + 1;
+      const bool softTrip = i == 49 && r.nCapEh * 10 > 50;
+      if (hardTrip || softTrip) {
         r.divergent = true;
-        std::cout << m << ": " << r.nCapEh << "/50 e+h avalanches hit the "
-                  << "cap -- hole-feedback divergence (f >= 1) at this "
-                  << "bias; G_eh undefined, aborting this model's e+h "
-                  << "pass." << std::endl;
+        std::cout << m << ": " << r.nCapEh << "/" << (i + 1)
+                  << " e+h avalanches hit the cap -- hole-feedback "
+                  << "divergence (f >= 1) at this bias; G_eh undefined, "
+                  << "aborting this model's e+h pass." << std::endl;
         break;
       }
     }
@@ -561,9 +623,7 @@ int main(int argc, char* argv[]) {
       m1 /= r.nEh;
       m2 /= r.nEh;
       r.F = m1 > 0. ? m2 / (m1 * m1) : 0.;
-      std::vector<std::size_t> tmp(mSizes);
-      std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
-      r.med = double(tmp[tmp.size() / 2]);
+      r.med = MedianOf(mSizes);
     }
     if (!r.divergent && r.nCapEh * 10 > r.nEh) r.divergent = true;
     std::cout << m << "   G_eh = " << r.geh << " +- " << r.gehSem
@@ -571,21 +631,26 @@ int main(int argc, char* argv[]) {
               << r.nCapEh << (r.divergent ? ", DIVERGENT" : "")
               << ")   F = " << r.F << "  [timer] " << ElapsedS(tEhStart)
               << " s" << std::endl;
-    std::ofstream fs(biasLabel == "NA" ? ("eh_sizes_" + m + ".txt")
+    std::ofstream fs(outDir + (biasLabel == "NA" ? ("eh_sizes_" + m + ".txt")
                                         : ("eh_sizes_" + m + "_" + biasLabel
-                                           + "V.txt"));
+                                           + "V.txt")));
     for (const auto s : mSizes) fs << s << "\n";
+    std::ofstream fge(outDir + (biasLabel == "NA" ? ("ge_sizes_" + m + ".txt")
+                                         : ("ge_sizes_" + m + "_" + biasLabel
+                                            + "V.txt")));
+    for (const auto s : geSizes) fge << s << "\n";
   }
   std::cout << "[stepfn ladder] calls=" << ladderFnCalls.load()
             << " fine=" << ladderFnFine.load() << " coarse="
             << ladderFnCoarse.load() << std::endl;
   std::cout << "[timer] model comparison: " << ElapsedS(tCmpStart)
             << " s" << std::endl;
-  std::cout << "\n# model   G_e            G_eh             median   F"
+  std::cout << "\n# model   G_e (median)         G_eh             median   F"
             << "      status" << std::endl;
   for (int im = 0; im < nCmpModels; ++im) {
     const ModelResult& r = cmpRes[im];
     std::cout << cmpModels[im] << "   " << r.ge << " +- " << r.geSem
+              << " (" << r.geMed << ")"
               << "   " << r.geh << " +- " << r.gehSem << "   " << r.med
               << "   " << r.F << "   "
               << (r.divergent ? "DIVERGENT (G_eh unreliable)" : "ok")
@@ -595,20 +660,21 @@ int main(int argc, char* argv[]) {
   // append one row per model to results.csv for the bias/model scan;
   // header written only if the file doesn't already exist
   {
-    std::ifstream ftest("results.csv");
+    std::ifstream ftest(outDir + "results.csv");
     const bool exists = ftest.good();
     ftest.close();
-    std::ofstream fres("results.csv", std::ios::app);
+    std::ofstream fres(outDir + "results.csv", std::ios::app);
     if (!exists) {
       fres << "bias,model,Epeak_line_Vcm,Epeak_global_Vcm,Ge,GeSem,Geh,"
-           << "GehSem,median,F,nCapEh,N,divergent\n";
+           << "GehSem,median,F,nCapEh,N,divergent,GeMedian\n";
     }
     for (int im = 0; im < nCmpModels; ++im) {
       const ModelResult& r = cmpRes[im];
       fres << biasLabel << "," << cmpModels[im] << "," << eMax << ","
            << gMax << "," << r.ge << "," << r.geSem << "," << r.geh << ","
            << r.gehSem << "," << r.med << "," << r.F << "," << r.nCapEh
-           << "," << r.nEh << "," << (r.divergent ? 1 : 0) << "\n";
+           << "," << r.nEh << "," << (r.divergent ? 1 : 0) << ","
+           << r.geMed << "\n";
     }
     std::cout << "appended " << nCmpModels << " rows to results.csv "
               << "(bias=" << biasLabel << ")" << std::endl;
@@ -644,51 +710,27 @@ int main(int argc, char* argv[]) {
   track.SetMomentum(180.e9); 
   sensor.ClearSignal();
 
-  track.NewTrack(x0, yTop + 0.01e-4, 0., 0., 0., 1., 0.); 
+  track.NewTrack(x0, yTop + 0.03e-4, 0., 0., 0., 1., 0.);
   double xc, yc, zc, tc, ec, extra;
   int nc = 0;
   unsigned long nPrimary = 0, nTotal = 0;
   unsigned long ncl = 0, nPairsDone = 0;
   double yLast = 0.;
-  // save primaries to replay with multiplication off (no-gain reference)
+  // collect the whole track first (Heed only, fast); both signal passes
+  // then replay the same primaries, and gain-ON runs last so its signal
+  // is left in the sensor -- no restore pass needed
   std::vector<std::array<double, 4>> primaries;  // {x, y, z, t}
-  const auto tMipOnStart = Clock::now();
   while (track.GetCluster(xc, yc, zc, tc, nc, ec, extra)) {
-    if (++ncl % 10 == 0) std::cout << "  cluster " << ncl << std::endl;
+    ++ncl;
     yLast = yc;
     nPrimary += nc;
-    for (int k = 0; k < nc; ++k) {
-      primaries.push_back({xc, yc, zc, tc});
-      aval.AvalancheElectronHole(xc, yc, zc, tc);
-      std::size_t ne = 0, ni = 0;
-      aval.GetAvalancheSize(ne, ni);
-      nTotal += ne;
-      // pair-level progress: clusters alone can hide long silent gaps,
-      // since a single cluster's primary count varies widely (delta rays)
-      if (++nPairsDone % 200 == 0) {
-        std::cout << "  pair " << nPairsDone << "  ["
-                  << ElapsedS(tMipOnStart) << " s elapsed]" << std::endl;
-      }
-    }
+    for (int k = 0; k < nc; ++k) primaries.push_back({xc, yc, zc, tc});
   }
-  std::cout << "MIP: " << ncl << " clusters, last at y = "
-            << yLast * 1.e4 << " um; " << nPrimary
-            << " primary e-h pairs, " << nTotal
-            << " electrons after multiplication -> counting gain "
-            << double(nTotal) / double(nPrimary) << std::endl;
-  std::cout << "[timer] MIP gain-ON pass: " << ElapsedS(tMipOnStart)
-            << " s (" << primaries.size() << " primaries)" << std::endl;
+  std::cout << "MIP track: " << ncl << " clusters, last at y = "
+            << yLast * 1.e4 << " um, " << nPrimary
+            << " primary e-h pairs" << std::endl;
 
-  double qInt = 0., iMax = 0.;
-  for (unsigned int i = 0; i < 800; ++i) {
-    const double s = sensor.GetSignal("pad", i);
-    qInt += s;
-    if (std::abs(s) > std::abs(iMax)) iMax = s;
-  }
-  std::cout << "signal check (gain ON): peak bin = " << iMax
-            << ", integral (arb.) = " << qInt << std::endl;
-
-  // no-gain reference: same primaries, multiplication disabled
+  // no-gain reference first (fast)
   sensor.ClearSignal();
   aval.EnableMultiplication(false);
   const auto tMipOffStart = Clock::now();
@@ -697,85 +739,131 @@ int main(int argc, char* argv[]) {
   }
   std::cout << "[timer] MIP gain-OFF pass: " << ElapsedS(tMipOffStart)
             << " s" << std::endl;
+  std::vector<double> sigOff(800, 0.);
   double qIntNoGain = 0., iMaxNoGain = 0.;
   for (unsigned int i = 0; i < 800; ++i) {
     const double s = sensor.GetSignal("pad", i);
+    sigOff[i] = s;
     qIntNoGain += s;
     if (std::abs(s) > std::abs(iMaxNoGain)) iMaxNoGain = s;
   }
   std::cout << "signal check (gain OFF, reference): peak bin = "
             << iMaxNoGain << ", integral (arb.) = " << qIntNoGain
             << std::endl;
+
+  // gain-ON last (slow); per-pair sizes to mip_pairs csv
+  sensor.ClearSignal();
+  aval.EnableMultiplication(true);
+  std::ofstream fpairs(outDir + (biasLabel == "NA" ? "mip_pairs.csv"
+      : ("mip_pairs_" + biasLabel + "V.csv")));
+  fpairs << "x_um,y_um,ne\n";
+  const auto tMipOnStart = Clock::now();
+  for (const auto& p : primaries) {
+    aval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
+    std::size_t ne = 0, ni = 0;
+    aval.GetAvalancheSize(ne, ni);
+    nTotal += ne;
+    fpairs << p[0] * 1.e4 << "," << p[1] * 1.e4 << "," << ne << "\n";
+    if (++nPairsDone % 200 == 0) {
+      std::cout << "  pair " << nPairsDone << "/" << primaries.size()
+                << "  [" << ElapsedS(tMipOnStart) << " s elapsed]"
+                << std::endl;
+    }
+  }
+  fpairs.close();
+  const double countingGain = double(nTotal) / double(nPrimary);
+  std::cout << "MIP: " << nTotal << " electrons after multiplication -> "
+            << "counting gain " << countingGain << std::endl;
+  std::cout << "[timer] MIP gain-ON pass: " << ElapsedS(tMipOnStart)
+            << " s (" << primaries.size() << " primaries)" << std::endl;
+
+  std::vector<double> sigOn(800, 0.);
+  double qInt = 0., iMax = 0.;
+  for (unsigned int i = 0; i < 800; ++i) {
+    const double s = sensor.GetSignal("pad", i);
+    sigOn[i] = s;
+    qInt += s;
+    if (std::abs(s) > std::abs(iMax)) iMax = s;
+  }
+  std::cout << "signal check (gain ON): peak bin = " << iMax
+            << ", integral (arb.) = " << qInt << std::endl;
   const double chargeGain = std::abs(qIntNoGain) > 0.
       ? qInt / qIntNoGain : 0.;
   std::cout << "charge-based gain (integral with gain / integral without) "
             << "= " << chargeGain << std::endl;
-  aval.EnableMultiplication(true);
 
-  // restore gain-ON signal for the plots below
-  sensor.ClearSignal();
-  const auto tMipRestoreStart = Clock::now();
-  for (const auto& p : primaries) {
-    aval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
+  // waveform export: 800 bins x 0.005 ns (window set at sensor setup)
+  {
+    std::ofstream fsig(outDir + (biasLabel == "NA" ? "signal_pad.csv"
+        : ("signal_" + biasLabel + "V.csv")));
+    fsig << "bin,t_ns,i_gainON,i_gainOFF\n";
+    for (unsigned int i = 0; i < 800; ++i) {
+      fsig << i << "," << (i + 0.5) * 0.005 << "," << sigOn[i] << ","
+           << sigOff[i] << "\n";
+    }
   }
-  std::cout << "[timer] MIP restore pass: " << ElapsedS(tMipRestoreStart)
-            << " s" << std::endl;
+  // one summary row per run (append, header once)
+  {
+    std::ifstream ftest(outDir + "mip_summary.csv");
+    const bool exists = ftest.good();
+    ftest.close();
+    std::ofstream fsum(outDir + "mip_summary.csv", std::ios::app);
+    if (!exists) {
+      fsum << "bias,model,nClusters,nPrimary,countingGain,chargeGain,"
+           << "peakOn,peakOff,intOn,intOff,elapsed_s\n";
+    }
+    fsum << biasLabel << "," << model << "," << ncl << "," << nPrimary
+         << "," << countingGain << "," << chargeGain << "," << iMax << ","
+         << iMaxNoGain << "," << qInt << "," << qIntNoGain << ","
+         << ElapsedS(tMipOnStart) << "\n";
+    std::cout << "appended MIP summary row (bias=" << biasLabel
+              << ", model=" << model << ") to mip_summary.csv" << std::endl;
+  }
   std::cout << "[stepfn aval] calls=" << avalFnCalls.load()
             << " fine=" << avalFnFine.load() << " coarse="
             << avalFnCoarse.load() << std::endl;
   std::cout << "[timer] total run so far: " << ElapsedS(tRunStart)
             << " s" << std::endl;
 
-  driftView.Plot2d();
+  if (display) {
+    driftView.Plot2d();
 
-  TCanvas c("c", "", 800, 600);
-  ViewSignal vs;
-  vs.SetSensor(&sensor);
-  vs.SetCanvas(&c);
-  vs.PlotSignal("pad");
-  c.SaveAs("signal_pad.pdf");
-
-  double t0 = 0.;
-  double dt = 0.05;
-  TCanvas canvas("c", "", 1400, 600);
-  canvas.Divide(2, 1);
-  auto pad1 = canvas.cd(1);
-  auto pad2 = canvas.cd(2);
-  driftView.SetCanvas((TPad*)canvas.cd(1));
-  vs.SetCanvas((TPad*)canvas.cd(2));
-
-  const std::size_t nFrames = 120;
-  const auto tMovieStart = Clock::now();
-  for (std::size_t i = 0; i < 120; ++i) {
-    driftView.Clear();
-    aval.SetTimeWindow(t0, t0 + dt);
-    aval.ResumeAvalanche();
-    driftView.Plot2d(true, true);
+    TCanvas c("c", "", 800, 600);
+    ViewSignal vs;
+    vs.SetSensor(&sensor);
+    vs.SetCanvas(&c);
     vs.PlotSignal("pad");
-    gSystem->ProcessEvents();
-    constexpr bool gif = true;
-    if (!gif) {
-      char filename[50];
-      snprintf(filename, 50, "frames/frame_%03zu.png", i);
-      canvas.SaveAs(filename);
-    } else {
+    c.SaveAs((outDir + "signal_pad.pdf").c_str());
+
+    double t0 = 0.;
+    double dt = 0.05;
+    TCanvas canvas("c", "", 1400, 600);
+    canvas.Divide(2, 1);
+    driftView.SetCanvas((TPad*)canvas.cd(1));
+    vs.SetCanvas((TPad*)canvas.cd(2));
+
+    const std::size_t nFrames = 120;
+    const auto tMovieStart = Clock::now();
+    for (std::size_t i = 0; i < nFrames; ++i) {
+      driftView.Clear();
+      aval.SetTimeWindow(t0, t0 + dt);
+      aval.ResumeAvalanche();
+      driftView.Plot2d(true, true);
+      vs.PlotSignal("pad");
+      gSystem->ProcessEvents();
       if (i == nFrames - 1) {
-        canvas.Print("planar_movie.gif++");
+        canvas.Print((outDir + "planar_movie.gif++").c_str());
       } else {
-        canvas.Print("planar_movie.gif+3");
+        canvas.Print((outDir + "planar_movie.gif+3").c_str());
       }
+      t0 += dt;
     }
-    t0 += dt;
+    std::cout << "[timer] movie loop (" << nFrames << " frames): "
+              << ElapsedS(tMovieStart) << " s" << std::endl;
   }
-  std::cout << "[timer] movie loop (120 frames): " << ElapsedS(tMovieStart)
-            << " s" << std::endl;
   std::cout << "[timer] TOTAL RUNTIME: " << ElapsedS(tRunStart)
             << " s" << std::endl;
   std::cout << "Done.\n";
-  
-  // TCanvas b("b", "", 800, 600);
-  // wfieldView.PlotContourWeightingField("strip", "v");
-  // b.SaveAs("weighting_field.pdf");
 
-  app.Run();
+  if (display) app.Run();
 }
