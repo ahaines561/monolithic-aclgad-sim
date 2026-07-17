@@ -30,7 +30,8 @@ int main(int argc, char* argv[]) {
 
   // CLI Arguments
   const std::string file = argc > 1 ? argv[1] : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad150V.sta";
-  const int nMips = argc > 2 ? std::atoi(argv[2]) : 50; // Default to 50 MIPs
+  const int nMips = argc > 2 ? std::atoi(argv[2]) : 200; //num of MIPs
+  const std::string biasV = "150V";
   const std::string outDir = "output_files/";
   std::filesystem::create_directories(outDir);
 
@@ -77,6 +78,7 @@ int main(int argc, char* argv[]) {
   wcmp.SetMedium(&si);
   wcmp.SetElectricField(0., 0., 0.);
   wcmp.SetWeightingField(0., 1. / d, 0., "pad");
+  wcmp.SetWeightingPotential(0.5 * (bx0 + bx1), yTop, 0., 1.);
 
   const double yFine = yGain + 2.5e-4;
 
@@ -141,32 +143,40 @@ int main(int argc, char* argv[]) {
     });
 
     #pragma omp for schedule(dynamic, 1)
-    for (int iTrk = 0; iTrk < nMips; ++iTrk) {
-      localSensor.ClearSignal();
-      
-      // Read the pre-generated HEED primaries for this track
-      for (const auto& p : allPrimaries[iTrk]) {
-        localAval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
-      }
+      for (int iTrk = 0; iTrk < nMips; ++iTrk) {
+        localSensor.ClearSignal();
 
-      for (unsigned int i = 0; i < 800; ++i) {
-        allSignals[iTrk][i] = localSensor.GetSignal("pad", i);
+        int nOk = 0, nFail = 0;
+        for (const auto& p : allPrimaries[iTrk]) {
+          bool ok = localAval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
+          if (ok) ++nOk; else ++nFail;
+        }
+
+        double sigSum = 0.;
+        for (unsigned int i = 0; i < 800; ++i) {
+          allSignals[iTrk][i] = localSensor.GetSignal("pad", i);
+          sigSum += std::abs(allSignals[iTrk][i]);
+        }
+
+        #pragma omp critical
+        {
+          std::cout << "  Track " << iTrk + 1 << "/" << nMips
+                    << " pairs=" << allPrimaries[iTrk].size()
+                    // << " ok=" << nOk << " fail=" << nFail
+                    // << " endpointsE=" << localAval.GetNumberOfElectronEndpoints()
+                    // << " endpointsH=" << localAval.GetHoles().size()
+                    // << " |signal|_sum=" << sigSum
+                    // << " | Thread " << omp_get_thread_num()
+                    << " | Elapsed: " << ElapsedS(tOverlayStart) << " s"
+                    << std::endl;
+        }
       }
-      
-      #pragma omp critical
-      {
-        std::cout << "  Track " << iTrk + 1 << "/" << nMips 
-                  << " generated " << allPrimaries[iTrk].size() << " pairs | Thread " 
-                  << omp_get_thread_num() << " | Elapsed: " 
-                  << ElapsedS(tOverlayStart) << " s" << std::endl;
-      }
-    }
   }
 
   std::cerr.rdbuf(oldCerr);
 
   //csv
-  std::ofstream fsig(outDir + "signal_overlay.csv");
+  std::ofstream fsig(outDir + "signal_overlay" + biasV + ".csv");
   fsig << "time_ns";
   for (int iTrk = 0; iTrk < nMips; ++iTrk) fsig << ",trk" << iTrk;
   fsig << "\n";
@@ -179,7 +189,7 @@ int main(int argc, char* argv[]) {
     fsig << "\n";
   }
   
-  std::cout << "\nOverlay CSV written to " << outDir << "signal_overlay.csv" << std::endl;
+  std::cout << "\nOverlay CSV written to " << outDir << "signal_overlay" + biasV + ".csv" << std::endl;
   std::cout << "TOTAL RUNTIME: " << ElapsedS(tRunStart) << " s" << std::endl;
   return 0;
 }

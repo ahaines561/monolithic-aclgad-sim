@@ -28,6 +28,7 @@
 #include "Garfield/ViewSignal.hh"
 #include "Garfield/ViewDrift.hh"
 #include "Garfield/ViewField.hh"
+#include "Garfield/ComponentAnalyticField.hh"
 
 using namespace Garfield;
 using Clock = std::chrono::steady_clock;
@@ -345,6 +346,14 @@ int main(int argc, char* argv[]) {
   wcmp.SetElectricField(0., 0., 0.);
   wcmp.SetWeightingField(0., 1. / d, 0., "pad");
   wcmp.SetWeightingPotential(0.5 * (bx0 + bx1), yTop, 0., 1.);
+
+  const double halfWidth = 50.e-4;
+
+  // ComponentAnalyticField wcmp;
+  // wcmp.AddPlaneY(yTop, 1., "top");
+  // wcmp.AddPlaneY(yBot, 0., "back");
+  // wcmp.AddStripOnPlaneY('z', yTop, x0 - halfWidth, x0 + halfWidth, "pad");
+  // wcmp.AddStripOnPlaneY('z', yTop, x0 - halfWidth, x0 + halfWidth, "pad");
   {
     const double yMid = 0.5 * (yTop + yBot);
     double wx = 0., wy = 0., wz = 0.;
@@ -429,7 +438,7 @@ int main(int argc, char* argv[]) {
         ++ladderFnCoarse;
         return bulkStepCm;
       });
-// #if 0  // convergence scan (retired): G_eh plateau from 50 nm down; 20 nm adopted
+#if 0  // convergence scan (retired): G_eh plateau from 50 nm down; 20 nm adopted
   // convergence scan: pick the coarsest step where G stops changing
   const double distanceStepsCm[] = {1.e-5, 5.e-6, 2.e-6, 1.e-6, 5.e-7, 1.e-7};
   std::vector<std::size_t> sizes;      // pooled only from the finest step
@@ -531,169 +540,166 @@ int main(int argc, char* argv[]) {
     std::cout << "avalanche sizes (finest step only) written to "
               << "eh_sizes.txt" << std::endl;
   }
-// #endif
+#endif
 
-  // // model comparison at the production step, same field map + injection points
-  // const char* cmpModels[] = {"vodm", "okuto", "massey", "grant"};
-  // const int nCmpModels = 4;
-  // struct ModelResult {
-  //   double ge = 0., geSem = 0., geMed = 0., geh = 0., gehSem = 0., F = 0.,
-  //          med = 0.;
-  //   int nCapEh = 0, nEh = 0;
-  //   bool divergent = false;
-  // } cmpRes[4];
-  // const auto tCmpStart = Clock::now();
-  // std::cout << "# model comparison: fine step = " << ladderStepCm * 1.e7
-  //           << " nm, bulk step = " << bulkStepCm * 1.e7 << " nm, cap = "
-  //           << ladderCap << std::endl;
-  // for (int im = 0; im < nCmpModels; ++im) {
-  //   const std::string m = cmpModels[im];
-  //   if (m == "okuto") {
-  //     si.SetImpactIonisationModelOkutoCrowell();
-  //   }
-  //   // if (m == "massey") {
-  //   //   si.SetImpactIonisationModelMassey();
-  //   // } else if (m == "okuto") {
-  //   //   si.SetImpactIonisationModelOkutoCrowell();
-  //   // } else if (m == "grant") {
-  //   //   si.SetImpactIonisationModelGrant();
-  //   // } else {
-  //   //   si.SetImpactIonisationModelVanOverstraetenDeMan();
-  //   // }
-  //   ModelResult& r = cmpRes[im];
-  //   // G_e: single-pass electron gain (no hole transport, always finite)
-  //   const auto tGeStart = Clock::now();
-  //   double sum = 0., sum2 = 0.;
-  //   const int nWantE = 200;
-  //   std::vector<std::size_t> geSizes;
-  //   for (int i = 0; i < nWantE; ++i) {
-  //     const double xi = x0 + (i % 5 - 2) * 2.e-4;
-  //     avalLadder.AvalancheElectron(xi, yInj, 0., 0.);
-  //     std::size_t ne = 0, ni = 0;
-  //     avalLadder.GetAvalancheSize(ne, ni);
-  //     sum += ne;
-  //     sum2 += double(ne) * double(ne);
-  //     geSizes.push_back(ne);
-  //   }
-  //   r.ge = sum / nWantE;
-  //   {
-  //     const double var = sum2 / nWantE - r.ge * r.ge;
-  //     r.geSem = std::sqrt(var > 0. ? var / nWantE : 0.);
-  //   }
-  //   r.geMed = MedianOf(geSizes);
-  //   std::cout << m << "   G_e  = " << r.ge << " +- " << r.geSem
-  //             << " (N=" << nWantE << ", median=" << r.geMed << ")  [timer] "
-  //             << ElapsedS(tGeStart) << " s" << std::endl;
-  //   // G_eh: full gain with hole feedback; diverges if f >= 1
-  //   const auto tEhStart = Clock::now();
-  //   sum = 0.;
-  //   sum2 = 0.;
-  //   std::vector<std::size_t> mSizes;
-  //   const int nWantEh = 300;
-  //   for (int i = 0; i < nWantEh; ++i) {
-  //     if (i % 50 == 0) std::cout << "  e+h injection " << i << std::endl;
-  //     const double xi = x0 + (i % 5 - 2) * 2.e-4;
-  //     avalLadder.AvalancheElectronHole(xi, yInj, 0., 0.);
-  //     std::size_t ne = 0, ni = 0;
-  //     avalLadder.GetAvalancheSize(ne, ni);
-  //     sum += ne;
-  //     sum2 += double(ne) * double(ne);
-  //     mSizes.push_back(ne);
-  //     if (ne >= ladderCap) ++r.nCapEh;
-  //     // divergence aborts: hard trip on sustained capping (6+ caps at
-  //     // >20% running fraction -- catches grant within ~10 events instead
-  //     // of paying for 32 cap-sized avalanches); soft trip at event 50 for
-  //     // >10% (backstop; leaves vodm's legitimate ~8% rate alone)
-  //     const bool hardTrip = r.nCapEh >= 6 && r.nCapEh * 5 > i + 1;
-  //     const bool softTrip = i == 49 && r.nCapEh * 10 > 50;
-  //     if (hardTrip || softTrip) {
-  //       r.divergent = true;
-  //       std::cout << m << ": " << r.nCapEh << "/" << (i + 1)
-  //                 << " e+h avalanches hit the cap -- hole-feedback "
-  //                 << "divergence (f >= 1) at this bias; G_eh undefined, "
-  //                 << "aborting this model's e+h pass." << std::endl;
-  //       break;
-  //     }
-  //   }
-  //   r.nEh = int(mSizes.size());
-  //   r.geh = sum / r.nEh;
-  //   {
-  //     const double var = sum2 / r.nEh - r.geh * r.geh;
-  //     r.gehSem = std::sqrt(var > 0. ? var / r.nEh : 0.);
-  //   }
-  //   {
-  //     double m1 = 0., m2 = 0.;
-  //     for (const auto s : mSizes) { m1 += s; m2 += double(s) * double(s); }
-  //     m1 /= r.nEh;
-  //     m2 /= r.nEh;
-  //     r.F = m1 > 0. ? m2 / (m1 * m1) : 0.;
-  //     r.med = MedianOf(mSizes);
-  //   }
-  //   if (!r.divergent && r.nCapEh * 10 > r.nEh) r.divergent = true;
-  //   std::cout << m << "   G_eh = " << r.geh << " +- " << r.gehSem
-  //             << " (N=" << r.nEh << ", median=" << r.med << ", capped="
-  //             << r.nCapEh << (r.divergent ? ", DIVERGENT" : "")
-  //             << ")   F = " << r.F << "  [timer] " << ElapsedS(tEhStart)
-  //             << " s" << std::endl;
-  //   std::ofstream fs(outDir + (biasLabel == "NA" ? ("eh_sizes_" + m + ".txt")
-  //                                       : ("eh_sizes_" + m + "_" + biasLabel
-  //                                          + "V.txt")));
-  //   for (const auto s : mSizes) fs << s << "\n";
-  //   std::ofstream fge(outDir + (biasLabel == "NA" ? ("ge_sizes_" + m + ".txt")
-  //                                        : ("ge_sizes_" + m + "_" + biasLabel
-  //                                           + "V.txt")));
-  //   for (const auto s : geSizes) fge << s << "\n";
-  // }
-  // std::cout << "[stepfn ladder] calls=" << ladderFnCalls.load()
-  //           << " fine=" << ladderFnFine.load() << " coarse="
-  //           << ladderFnCoarse.load() << std::endl;
-  // std::cout << "[timer] model comparison: " << ElapsedS(tCmpStart)
-  //           << " s" << std::endl;
-  // std::cout << "\n# model   G_e (median)         G_eh             median   F"
-  //           << "      status" << std::endl;
-  // for (int im = 0; im < nCmpModels; ++im) {
-  //   const ModelResult& r = cmpRes[im];
-  //   std::cout << cmpModels[im] << "   " << r.ge << " +- " << r.geSem
-  //             << " (" << r.geMed << ")"
-  //             << "   " << r.geh << " +- " << r.gehSem << "   " << r.med
-  //             << "   " << r.F << "   "
-  //             << (r.divergent ? "DIVERGENT (G_eh unreliable)" : "ok")
-  //             << std::endl;
-  // }
+  // model comparison at the production step, same field map + injection points
+  const char* cmpModels[] = {"vodm", "okuto", "massey", "grant"};
+  const int nCmpModels = 4;
+  struct ModelResult {
+    double ge = 0., geSem = 0., geMed = 0., geh = 0., gehSem = 0., F = 0.,
+           med = 0.;
+    int nCapEh = 0, nEh = 0;
+    bool divergent = false;
+  } cmpRes[4];
+  const auto tCmpStart = Clock::now();
+  std::cout << "# model comparison: fine step = " << ladderStepCm * 1.e7
+            << " nm, bulk step = " << bulkStepCm * 1.e7 << " nm, cap = "
+            << ladderCap << std::endl;
+  for (int im = 0; im < nCmpModels; ++im) {
+    const std::string m = cmpModels[im];
+    if (m == "massey") {
+      si.SetImpactIonisationModelMassey();
+    } else if (m == "okuto") {
+      si.SetImpactIonisationModelOkutoCrowell();
+    } else if (m == "grant") {
+      si.SetImpactIonisationModelGrant();
+    } else {
+      si.SetImpactIonisationModelVanOverstraetenDeMan();
+    }
+    ModelResult& r = cmpRes[im];
+    // G_e: single-pass electron gain (no hole transport, always finite)
+    const auto tGeStart = Clock::now();
+    double sum = 0., sum2 = 0.;
+    const int nWantE = 200;
+    std::vector<std::size_t> geSizes;
+    for (int i = 0; i < nWantE; ++i) {
+      const double xi = x0 + (i % 5 - 2) * 2.e-4;
+      avalLadder.AvalancheElectron(xi, yInj, 0., 0.);
+      std::size_t ne = 0, ni = 0;
+      avalLadder.GetAvalancheSize(ne, ni);
+      sum += ne;
+      sum2 += double(ne) * double(ne);
+      geSizes.push_back(ne);
+    }
+    r.ge = sum / nWantE;
+    {
+      const double var = sum2 / nWantE - r.ge * r.ge;
+      r.geSem = std::sqrt(var > 0. ? var / nWantE : 0.);
+    }
+    r.geMed = MedianOf(geSizes);
+    std::cout << m << "   G_e  = " << r.ge << " +- " << r.geSem
+              << " (N=" << nWantE << ", median=" << r.geMed << ")  [timer] "
+              << ElapsedS(tGeStart) << " s" << std::endl;
+    // G_eh: full gain with hole feedback; diverges if f >= 1
+    const auto tEhStart = Clock::now();
+    sum = 0.;
+    sum2 = 0.;
+    std::vector<std::size_t> mSizes;
+    const int nWantEh = 300;
+    for (int i = 0; i < nWantEh; ++i) {
+      if (i % 50 == 0) std::cout << "  e+h injection " << i << std::endl;
+      const double xi = x0 + (i % 5 - 2) * 2.e-4;
+      avalLadder.AvalancheElectronHole(xi, yInj, 0., 0.);
+      std::size_t ne = 0, ni = 0;
+      avalLadder.GetAvalancheSize(ne, ni);
+      sum += ne;
+      sum2 += double(ne) * double(ne);
+      mSizes.push_back(ne);
+      if (ne >= ladderCap) ++r.nCapEh;
+      // divergence aborts: hard trip on sustained capping (6+ caps at
+      // >20% running fraction -- catches grant within ~10 events instead
+      // of paying for 32 cap-sized avalanches); soft trip at event 50 for
+      // >10% (backstop; leaves vodm's legitimate ~8% rate alone)
+      const bool hardTrip = r.nCapEh >= 6 && r.nCapEh * 5 > i + 1;
+      const bool softTrip = i == 49 && r.nCapEh * 10 > 50;
+      if (hardTrip || softTrip) {
+        r.divergent = true;
+        std::cout << m << ": " << r.nCapEh << "/" << (i + 1)
+                  << " e+h avalanches hit the cap -- hole-feedback "
+                  << "divergence (f >= 1) at this bias; G_eh undefined, "
+                  << "aborting this model's e+h pass." << std::endl;
+        break;
+      }
+    }
+    r.nEh = int(mSizes.size());
+    r.geh = sum / r.nEh;
+    {
+      const double var = sum2 / r.nEh - r.geh * r.geh;
+      r.gehSem = std::sqrt(var > 0. ? var / r.nEh : 0.);
+    }
+    {
+      double m1 = 0., m2 = 0.;
+      for (const auto s : mSizes) { m1 += s; m2 += double(s) * double(s); }
+      m1 /= r.nEh;
+      m2 /= r.nEh;
+      r.F = m1 > 0. ? m2 / (m1 * m1) : 0.;
+      r.med = MedianOf(mSizes);
+    }
+    if (!r.divergent && r.nCapEh * 10 > r.nEh) r.divergent = true;
+    std::cout << m << "   G_eh = " << r.geh << " +- " << r.gehSem
+              << " (N=" << r.nEh << ", median=" << r.med << ", capped="
+              << r.nCapEh << (r.divergent ? ", DIVERGENT" : "")
+              << ")   F = " << r.F << "  [timer] " << ElapsedS(tEhStart)
+              << " s" << std::endl;
+    std::ofstream fs(outDir + (biasLabel == "NA" ? ("eh_sizes_" + m + ".txt")
+                                        : ("eh_sizes_" + m + "_" + biasLabel
+                                           + "V.txt")));
+    for (const auto s : mSizes) fs << s << "\n";
+    std::ofstream fge(outDir + (biasLabel == "NA" ? ("ge_sizes_" + m + ".txt")
+                                         : ("ge_sizes_" + m + "_" + biasLabel
+                                            + "V.txt")));
+    for (const auto s : geSizes) fge << s << "\n";
+  }
+  std::cout << "[stepfn ladder] calls=" << ladderFnCalls.load()
+            << " fine=" << ladderFnFine.load() << " coarse="
+            << ladderFnCoarse.load() << std::endl;
+  std::cout << "[timer] model comparison: " << ElapsedS(tCmpStart)
+            << " s" << std::endl;
+  std::cout << "\n# model   G_e (median)         G_eh             median   F"
+            << "      status" << std::endl;
+  for (int im = 0; im < nCmpModels; ++im) {
+    const ModelResult& r = cmpRes[im];
+    std::cout << cmpModels[im] << "   " << r.ge << " +- " << r.geSem
+              << " (" << r.geMed << ")"
+              << "   " << r.geh << " +- " << r.gehSem << "   " << r.med
+              << "   " << r.F << "   "
+              << (r.divergent ? "DIVERGENT (G_eh unreliable)" : "ok")
+              << std::endl;
+  }
 
-  // // append one row per model to results.csv for the bias/model scan;
-  // // header written only if the file doesn't already exist
-  // {
-  //   std::ifstream ftest(outDir + "results.csv");
-  //   const bool exists = ftest.good();
-  //   ftest.close();
-  //   std::ofstream fres(outDir + "results.csv", std::ios::app);
-  //   if (!exists) {
-  //     fres << "bias,model,Epeak_line_Vcm,Epeak_global_Vcm,Ge,GeSem,Geh,"
-  //          << "GehSem,median,F,nCapEh,N,divergent,GeMedian\n";
-  //   }
-  //   for (int im = 0; im < nCmpModels; ++im) {
-  //     const ModelResult& r = cmpRes[im];
-  //     fres << biasLabel << "," << cmpModels[im] << "," << eMax << ","
-  //          << gMax << "," << r.ge << "," << r.geSem << "," << r.geh << ","
-  //          << r.gehSem << "," << r.med << "," << r.F << "," << r.nCapEh
-  //          << "," << r.nEh << "," << (r.divergent ? 1 : 0) << ","
-  //          << r.geMed << "\n";
-  //   }
-  //   std::cout << "appended " << nCmpModels << " rows to results.csv "
-  //             << "(bias=" << biasLabel << ")" << std::endl;
-  // }
+  // append one row per model to results.csv for the bias/model scan;
+  // header written only if the file doesn't already exist
+  {
+    std::ifstream ftest(outDir + "results.csv");
+    const bool exists = ftest.good();
+    ftest.close();
+    std::ofstream fres(outDir + "results.csv", std::ios::app);
+    if (!exists) {
+      fres << "bias,model,Epeak_line_Vcm,Epeak_global_Vcm,Ge,GeSem,Geh,"
+           << "GehSem,median,F,nCapEh,N,divergent,GeMedian\n";
+    }
+    for (int im = 0; im < nCmpModels; ++im) {
+      const ModelResult& r = cmpRes[im];
+      fres << biasLabel << "," << cmpModels[im] << "," << eMax << ","
+           << gMax << "," << r.ge << "," << r.geSem << "," << r.geh << ","
+           << r.gehSem << "," << r.med << "," << r.F << "," << r.nCapEh
+           << "," << r.nEh << "," << (r.divergent ? 1 : 0) << ","
+           << r.geMed << "\n";
+    }
+    std::cout << "appended " << nCmpModels << " rows to results.csv "
+              << "(bias=" << biasLabel << ")" << std::endl;
+  }
 
-  // restore the CLI-selected model for the MIP section
-  // if (model == "massey") {
-  //   si.SetImpactIonisationModelMassey();
-  // } else if (model == "grant") {
-  //   si.SetImpactIonisationModelGrant();
-  // } else if (model == "okuto") {
-  //   si.SetImpactIonisationModelOkutoCrowell();
-  // } else {
-  //   si.SetImpactIonisationModelVanOverstraetenDeMan();
-  // }
+  //restore the CLI-selected model for the MIP section
+  if (model == "massey") {
+    si.SetImpactIonisationModelMassey();
+  } else if (model == "grant") {
+    si.SetImpactIonisationModelGrant();
+  } else if (model == "okuto") {
+    si.SetImpactIonisationModelOkutoCrowell();
+  } else {
+    si.SetImpactIonisationModelVanOverstraetenDeMan();
+  }
 
   if (!doMIP) return 0;
 
