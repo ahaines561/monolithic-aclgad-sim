@@ -181,6 +181,12 @@ int main(int argc, char* argv[]) {
   for (int iTrk = 0; iTrk < nMips; ++iTrk) fsig << ",trk" << iTrk;
   fsig << "\n";
 
+  fsig << "nPairs";
+  for (int iTrk = 0; iTrk < nMips; ++iTrk){
+    fsig << "," << allPrimaries[iTrk].size();
+  }
+  fsig << "\n";
+
   for (unsigned int i = 0; i < 800; ++i) {
     fsig << (i + 0.5) * 0.005;
     for (int iTrk = 0; iTrk < nMips; ++iTrk) {
