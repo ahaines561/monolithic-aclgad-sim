@@ -45,7 +45,9 @@ int main(int argc, char* argv[]) {
   si.SetTemperature(300);
   si.SetImpactIonisationModelOkutoCrowell();
 
-  cmp.SetMedium("3", &si);
+  for (unsigned int i = 0; i < cmp.GetNumberOfRegions(); ++i) {
+    cmp.SetMedium(i, &si);
+  }
   cmp.SetRangeZ(-5.e-4, 5.e-4);
 
   // Get Bounding Box
