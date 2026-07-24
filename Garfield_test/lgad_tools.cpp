@@ -1,5 +1,7 @@
 #include "lgad_tools.hh"
 
+#include "Garfield/Sensor.hh"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -67,15 +69,21 @@ bool StripsInsideMap(const std::vector<Strip>& strips, double bx0,
 }
 
 void ScanValidity(Component& cmp, double x0, double x1, double y0,
-                  double y1, int nx, int ny, const std::string& csvPath) {
+                  double y1, int nx, int ny, const std::string& csvPath,
+                  double eps) {
   const auto tStart = Clock::now();
   std::ofstream fvalid(csvPath);
   fvalid << "x_um,y_um,status\n";
   std::size_t nInvalid = 0, nScanned = 0;
+  // nudge off exact mesh coordinates: a point landing exactly on a node
+  // or element edge belongs to neither adjoining element under strict
+  // inequality tests, so lookup fails and the point reads as invalid even
+  // where the region is perfectly good. DumpElectricField carries the
+  // same eps for the same reason.
   for (int ix = 0; ix <= nx; ++ix) {
-    const double x = x0 + (x1 - x0) * ix / nx;
+    const double x = x0 + (x1 - x0) * ix / nx + eps;
     for (int iy = 0; iy <= ny; ++iy) {
-      const double y = y0 + (y1 - y0) * iy / ny;
+      const double y = y0 + (y1 - y0) * iy / ny + eps;
       double ex, ey, ez, v; int st; Medium* m = nullptr;
       cmp.ElectricField(x, y, 0., ex, ey, ez, v, m, st);
       ++nScanned;
@@ -98,26 +106,40 @@ diagnostics (active silicon bounds, peak field, low-field NOTE, or the
 
 FieldProfile ScanFieldProfile(Component& cmp, double x0, double y0,
                               double y1, int nScan,
-                              const std::string& csvPath) {
+                              const std::string& csvPath,
+                              double eMinVcm) {
   FieldProfile prof;
   std::ofstream fprof(csvPath);
   fprof << "y_um,V,Ex_Vcm,Ey_Vcm,Emag_Vcm\n";
   // sentinel-swap: yTop starts above yBot so "yTop > yBot" doubles as a
   // "first valid point found yet?" flag; see main.cpp's original comment.
   double yTop = 1., yBot = -1.;
+  std::size_t nDead = 0;
   for (int i = 0; i <= nScan; ++i) {
     const double y = y0 + ((y1 - y0) * i) / nScan;
     double ex, ey, ez, v; int st; Medium* m = nullptr;
     cmp.ElectricField(x0, y, 0., ex, ey, ez, v, m, st);
     if (st != 0) continue;
-    if (yTop > yBot) yTop = y;
-    yBot = y;
     const double e = std::sqrt(ex * ex + ey * ey);
-    if (e > prof.eMax) { prof.eMax = e; prof.yGain = y; }
+    // still dumped for diagnostics, but excluded from the active bounds:
+    // carriers in a valid-but-fieldless region (undepleted top layer)
+    // have no drift velocity, cannot leave, and burn the whole time
+    // window in tiny steps -- the dominant runtime cost when included.
+    if (e < eMinVcm) { ++nDead; }
+    else {
+      if (yTop > yBot) yTop = y;
+      yBot = y;
+      if (e > prof.eMax) { prof.eMax = e; prof.yGain = y; }
+    }
     fprof << y * 1.e4 << "," << v << "," << ex << "," << ey << ","
           << e << "\n";
   }
   fprof.close();
+  if (nDead > 0) {
+    std::cout << "field profile: " << nDead << " valid point(s) below "
+              << eMinVcm << " V/cm excluded from the active region"
+              << std::endl;
+  }
   if (yTop > yBot) {
     std::cerr << "No valid drift medium found along the scan line --\n"
               << "check the region/material assignment above.\n";
@@ -258,6 +280,105 @@ void DumpWeightingField(ComponentAnalyticField& wcmp,
             << " points)" << std::endl;
   std::cout << "[timer] weighting field dump: " << ElapsedS(tStart)
             << " s" << std::endl;
+}
+
+/* parallel avalanche pass (OpenMP)
+- one Sensor + one AvalancheMC per thread; only the read-only field
+  components are shared. Mirrors the pattern proven in 1000MIPs.cpp.
+- per-thread signals are summed at the end (induced signals are additive)
+- without -fopenmp the pragmas are ignored and this runs serially */
+unsigned long RunAvalanchePass(
+    Component& driftCmp, ComponentAnalyticField& wcmp,
+    const std::vector<Strip>& strips,
+    const std::vector<std::array<double, 4>>& primaries,
+    const AvalanchePassConfig& pc,
+    std::vector<std::vector<double>>& signalOut,
+    std::ofstream* pairsCsv, unsigned long printEvery,
+    const std::string& tag) {
+  const std::size_t nStrips = strips.size();
+  signalOut.assign(nStrips, std::vector<double>(pc.nBins, 0.));
+  unsigned long nTotal = 0;
+  std::atomic<unsigned long> nDone{0};  // incremented lock-free by all threads
+  const auto tStart = Clock::now();
+  const long long nPrim = static_cast<long long>(primaries.size());
+
+  // Garfield prints an oversubscription notice per avalanche when called
+  // from inside an OpenMP region. That IS the intended behaviour here
+  // (one Garfield thread per OpenMP thread), but it floods stderr.
+  std::ofstream devNull;
+  std::streambuf* oldCerr = nullptr;
+  if (pc.silenceGarfieldStderr) {
+    devNull.open("/dev/null");
+    oldCerr = std::cerr.rdbuf(devNull.rdbuf());
+  }
+
+  #pragma omp parallel
+  {
+    // Sensor construction prints to stdout; serialise it so 8 threads'
+    // messages don't interleave into garbage. Once per thread, so free.
+    Sensor localSensor;
+    #pragma omp critical
+    {
+      localSensor.AddComponent(&driftCmp);
+      for (const auto& s : strips) localSensor.AddElectrode(&wcmp, s.label);
+      localSensor.SetTimeWindow(pc.tStart, pc.tStep, pc.nBins);
+      localSensor.SetArea(pc.xMin, pc.yMin, pc.zMin,
+                          pc.xMax, pc.yMax, pc.zMax);
+    }
+
+    double stepCm = pc.fineStepCm;
+    // nPrinted seeded high so worker threads don't each dump 5 stepfn lines
+    std::atomic<long long> nCalls{0}, nFine{0}, nCoarse{0}, nPrinted{1000};
+    AvalancheMC localAval;
+    localAval.SetSensor(&localSensor);
+    ConfigureAvalanche(localAval, stepCm, pc.bulkStepCm, pc.yFineLoCm,
+                       pc.yFineHiCm, pc.timeWindowNs, pc.sizeCap,
+                       /*enableSignal=*/true, /*multithreading=*/false,
+                       tag, nCalls, nFine, nCoarse, nPrinted);
+    localAval.EnableMultiplication(pc.multiplication);
+
+    // per-thread CSV buffer: writing inside the loop would take a lock on
+    // every single pair, serialising all threads
+    std::ostringstream localRows;
+
+    #pragma omp for schedule(dynamic, 16) reduction(+ : nTotal)
+    for (long long i = 0; i < nPrim; ++i) {
+      const auto& p = primaries[i];
+      localAval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
+      std::size_t ne = 0, ni = 0;
+      localAval.GetAvalancheSize(ne, ni);
+      nTotal += ne;
+      if (pairsCsv) {
+        localRows << p[0] * 1.e4 << "," << p[1] * 1.e4 << "," << ne << "\n";
+      }
+      if (printEvery) {
+        const unsigned long done = ++nDone;  // atomic, no lock
+        if (done % printEvery == 0) {
+          #pragma omp critical
+          {
+            std::cout << "  [" << tag << "] pair " << done << "/" << nPrim
+                      << "  [" << ElapsedS(tStart) << " s]" << std::endl;
+          }
+        }
+      }
+    }
+
+    // superposition: summing each thread's induced signal is equivalent
+    // to having accumulated them all in one sensor. Rows are flushed here
+    // too, so mip_pairs.csv is grouped by thread rather than track order
+    // (each row carries its own x,y so order carries no information).
+    #pragma omp critical
+    {
+      if (pairsCsv) *pairsCsv << localRows.str();
+      for (std::size_t k = 0; k < nStrips; ++k) {
+        for (unsigned int b = 0; b < pc.nBins; ++b) {
+          signalOut[k][b] += localSensor.GetSignal(strips[k].label, b);
+        }
+      }
+    }
+  }
+  if (oldCerr) std::cerr.rdbuf(oldCerr);
+  return nTotal;
 }
 
 /* convergence scan

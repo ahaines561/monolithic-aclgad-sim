@@ -25,20 +25,22 @@ struct RunConfig {
                         // "lgad150V.sta";
                         // "lgad180V.sta";
                         // "lgad190V.sta";
-                        "aclgad.sta";
-  std::string outDir = "output_files_aclgad/";
+                        // "aclgad.sta";
+                        "lgad_deepjte_180V_X80.sta";
+  std::string outDir = "output_files_150V/";
 
   double biasVOverride = std::numeric_limits<double>::quiet_NaN();
-  double xTrackUm = 250.;  // MIP track position (250 = under strip1)
+  double xTrackUm = 80.;  // MIP track position
   bool doWeightingDump = true; // DumpWeightingField
   bool doConvergenceScan = false;  // RunConvergenceScan
-  bool doModelComparison = false; // RunModelComparison
+  bool doModelComparison = true; // RunModelComparison
   bool doMIP = true;
   std::string model = "okuto";
-  double driftWindowNs = 6.; // must exceed the 4ns signal window
-  double fineStepNm = 20.; // step size inside the gain-layer band
+  double driftWindowNs = 4.; // must exceed the 4ns signal window
+  double fineStepNm = 50.; // step size inside the gain-layer band
   double bulkStepNm = 250.;  // step size everywhere else
   double fineBandHalfWidthUm = 2.5;  // band = [yGain-this, yGain+this]
+  double activeFieldMinVcm = 100.;
 };
 
 int main() {
@@ -57,7 +59,7 @@ int main() {
   if (!cmp.InitialiseSilvaco(cfg.file)) return 1;
 
   MediumSilicon si;
-  si.SetTemperature(300);
+  si.SetTemperature(293.15);
   if (cfg.model == "massey") {
     si.SetImpactIonisationModelMassey();
   } else if (cfg.model == "grant") {
@@ -72,9 +74,7 @@ int main() {
                         cfg.model == "okuto"
                     ? cfg.model : "vodm (van Overstraeten-de Man)")
             << std::endl;
-  for (unsigned int i = 0; i < cmp.GetNumberOfRegions(); ++i) {
-    cmp.SetMedium(i, &si);
-  }
+  cmp.SetMedium(0, &si);
   cmp.SetRangeZ(-5.e-4, 5.e-4);
   cmp.PrintRegions();
 
@@ -105,7 +105,8 @@ int main() {
   const auto prof = ScanFieldProfile(cmp, x0, by0, by1, 400,
                                      cfg.outDir + (biasLabel == "NA"
                                          ? "profile.csv"
-                                         : "profile_" + biasLabel + "V.csv"));
+                                         : "profile_" + biasLabel + "V.csv"),
+                                     cfg.activeFieldMinVcm);
   if (!prof.valid) return 1;
   const double yTop = prof.yTop;
   const double yBot = prof.yBot;
@@ -198,7 +199,7 @@ int main() {
       int nc = 0;
       unsigned long nPrimary = 0;
       while (htrack.GetCluster(xc, yc, zc, tc, nc, ec, extra)) {
-        nPrimary += nc;
+      nPrimary += nc;
       }
       fprim << nPrimary << "\n";
     }
@@ -209,12 +210,15 @@ int main() {
               << ElapsedS(tHeedStart) << " s" << std::endl;
   }
 
-  // 3 strips from the mask: edge -> centre/half-width
-  //   M1 30-70->50,20  M2 220-270->245,25  M3 430-470->450,20
+  // strips canode/cathode
+  // const std::vector<Strip> strips = {
+  //   {"strip0",  50., 20.},
+  //   {"strip1", 245., 25.},
+  //   {"strip2", 450., 20.},
+  // };
   const std::vector<Strip> strips = {
-    {"strip0",  50., 20.},
-    {"strip1", 245., 25.},
-    {"strip2", 450., 20.},
+    {"anode",  22.5, 22.5},
+    {"cathode", 77.5, 22.5},
   };
   if (!StripsInsideMap(strips, bx0, bx1)) return 1;
 
@@ -236,7 +240,7 @@ int main() {
 
   if (cfg.doWeightingDump) {
     DumpWeightingField(wcmp, strips, bx0, bx1, yTop, yBot,
-                       cfg.outDir + "wfield_full.txt");
+                       cfg.outDir + "wfield_full.csv");
   }
 
   sensor.SetTimeWindow(0., 0.005, 800);
@@ -245,19 +249,10 @@ int main() {
   const double fineStepCm = cfg.fineStepNm * 1.e-7;   // nm -> cm
   const double bulkStepCm = cfg.bulkStepNm * 1.e-7;
   const double fineBandCm = cfg.fineBandHalfWidthUm * 1.e-4;
-  const double yFineLo = yGain - fineBandCm, yFineHi = yGain + fineBandCm;
+  const double yFineLo = std::max(yGain - fineBandCm, yTop);
+  const double yFineHi = std::min(yGain + fineBandCm, yBot);
 
-  double avalStepCm = fineStepCm;  // mutable -- captured by ref in the
-                                    // step function set up below
-  std::atomic<long long> avalCalls{0}, avalFine{0}, avalCoarse{0},
-      avalPrinted{0};
-  AvalancheMC aval;
-  aval.SetSensor(&sensor);
   const std::size_t sizeCap = 5000;
-  ConfigureAvalanche(aval, avalStepCm, bulkStepCm, yFineLo, yFineHi,
-                     cfg.driftWindowNs, sizeCap, /*enableSignal=*/true,
-                     /*multithreading=*/true, "aval", avalCalls, avalFine,
-                     avalCoarse, avalPrinted);
 
   const double yInj = std::min(yGain + 5.e-4, 0.5 * (yGain + yBot));
   double ladderStepCm = fineStepCm;
@@ -326,7 +321,6 @@ int main() {
   unsigned long nPrimary = 0; // total e-h pairs, all clusters
   unsigned long ncl = 0;  // cluster count
   unsigned long nTotal = 0; // electrons after multiplication (gain-ON loop)
-  unsigned long nPairsDone = 0; // gain-ON loop progress counter
   double yLast = 0.;
 
   std::vector<std::array<double, 4>> primaries;
@@ -340,29 +334,30 @@ int main() {
             << yLast * 1.e4 << " um, " << nPrimary
             << " primary e-h pairs" << std::endl;
 
-  sensor.ClearSignal();
-  aval.EnableMultiplication(false);
+  // shared pass settings for both OFF and ON
+  AvalanchePassConfig pc;
+  pc.fineStepCm = fineStepCm;
+  pc.bulkStepCm = bulkStepCm;
+  pc.yFineLoCm = yFineLo;
+  pc.yFineHiCm = yFineHi;
+  pc.timeWindowNs = cfg.driftWindowNs;
+  pc.sizeCap = sizeCap;
+  pc.xMin = bx0; pc.yMin = yTop + 0.02e-4; pc.zMin = -5.e-4;
+  pc.xMax = bx1; pc.yMax = yBot;           pc.zMax = 5.e-4;
+  pc.tStart = 0.; pc.tStep = 0.005; pc.nBins = 800;
+
+  std::vector<std::vector<double>> sigOff;
   const auto tMipOffStart = Clock::now();
-  {
-    unsigned long nOffDone = 0;
-    for (const auto& p : primaries) {
-      aval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
-      if (++nOffDone % 500 == 0) {
-        std::cout << "  [OFF] pair " << nOffDone << "/" << primaries.size()
-                  << "  [" << ElapsedS(tMipOffStart) << " s]" << std::endl;
-      }
-    }
-  }
+  pc.multiplication = false;
+  RunAvalanchePass(cmp, wcmp, strips, primaries, pc, sigOff, nullptr, 500,
+                   "OFF");
   std::cout << "[timer] MIP gain-OFF pass: " << ElapsedS(tMipOffStart)
             << " s" << std::endl;
-  std::vector<std::vector<double>> sigOff(strips.size(),
-                                          std::vector<double>(800, 0.));
   std::vector<double> qIntNoGain(strips.size(), 0.),
       iMaxNoGain(strips.size(), 0.);
   for (std::size_t k = 0; k < strips.size(); ++k) {
     for (unsigned int i = 0; i < 800; ++i) {
-      const double s = sensor.GetSignal(strips[k].label, i);
-      sigOff[k][i] = s;
+      const double s = sigOff[k][i];
       qIntNoGain[k] += s;
       if (std::abs(s) > std::abs(iMaxNoGain[k])) iMaxNoGain[k] = s;
     }
@@ -371,24 +366,14 @@ int main() {
               << std::endl;
   }
 
-  sensor.ClearSignal();
-  aval.EnableMultiplication(true);
   std::ofstream fpairs(cfg.outDir + (biasLabel == "NA" ? "mip_pairs.csv"
       : ("mip_pairs_" + biasLabel + "V.csv")));
   fpairs << "x_um,y_um,ne\n";
+  std::vector<std::vector<double>> sigOn;
   const auto tMipOnStart = Clock::now();
-  for (const auto& p : primaries) {
-    aval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
-    std::size_t ne = 0, ni = 0;
-    aval.GetAvalancheSize(ne, ni);
-    nTotal += ne;
-    fpairs << p[0] * 1.e4 << "," << p[1] * 1.e4 << "," << ne << "\n";
-    if (++nPairsDone % 200 == 0) {
-      std::cout << "  pair " << nPairsDone << "/" << primaries.size()
-                << "  [" << ElapsedS(tMipOnStart) << " s elapsed]"
-                << std::endl;
-    }
-  }
+  pc.multiplication = true;
+  nTotal = RunAvalanchePass(cmp, wcmp, strips, primaries, pc, sigOn,
+                            &fpairs, 200, "ON");
   fpairs.close();
   const double countingGain = double(nTotal) / double(nPrimary);
   std::cout << "MIP: " << nTotal << " electrons after multiplication -> "
@@ -396,13 +381,10 @@ int main() {
   std::cout << "[timer] MIP gain-ON pass: " << ElapsedS(tMipOnStart)
             << " s (" << primaries.size() << " primaries)" << std::endl;
 
-  std::vector<std::vector<double>> sigOn(strips.size(),
-                                         std::vector<double>(800, 0.));
   std::vector<double> qInt(strips.size(), 0.), iMax(strips.size(), 0.);
   for (std::size_t k = 0; k < strips.size(); ++k) {
     for (unsigned int i = 0; i < 800; ++i) {
-      const double s = sensor.GetSignal(strips[k].label, i);
-      sigOn[k][i] = s;
+      const double s = sigOn[k][i];
       qInt[k] += s;
       if (std::abs(s) > std::abs(iMax[k])) iMax[k] = s;
     }
@@ -493,9 +475,6 @@ int main() {
               << ", model=" << cfg.model << ", peak strip="
               << strips[kPeak].label << ") to mip_summary.csv" << std::endl;
   }
-  std::cout << "[stepfn aval] calls=" << avalCalls.load()
-            << " fine=" << avalFine.load() << " coarse="
-            << avalCoarse.load() << std::endl;
   std::cout << "[timer] total run so far: " << ElapsedS(tRunStart)
             << " s" << std::endl;
 

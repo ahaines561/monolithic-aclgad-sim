@@ -1,38 +1,32 @@
-#include <cmath>
-#include <cstdlib>
-#include <fstream>
-#include <vector>
+#include <algorithm>
 #include <array>
-#include <chrono>
-#include <iostream>
+#include <atomic>
+#include <cmath>
 #include <filesystem>
-#include <iomanip>
-#include <omp.h>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <vector>
 
 #include "Garfield/ComponentTcad2d.hh"
 #include "Garfield/ComponentConstant.hh"
-#include "Garfield/MediumSilicon.hh"
-#include "Garfield/Sensor.hh"
 #include "Garfield/GeometrySimple.hh"
+#include "Garfield/Sensor.hh"
 #include "Garfield/SolidBox.hh"
 #include "Garfield/TrackHeed.hh"
-#include "Garfield/AvalancheMC.hh"
+
+#include "lgad_tools.hh"
 
 using namespace Garfield;
-using Clock = std::chrono::steady_clock;
-
-double ElapsedS(const Clock::time_point& t0) {
-  return std::chrono::duration<double>(Clock::now() - t0).count();
-}
 
 int main(int argc, char* argv[]) {
   const auto tRunStart = Clock::now();
 
   // CLI Arguments
-  const std::string file = argc > 1 ? argv[1] : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad150V.sta";
+  const std::string file = argc > 1 ? argv[1] : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad190V.sta";
   const int nMips = argc > 2 ? std::atoi(argv[2]) : 200; //num of MIPs
-  const std::string biasV = "150V";
-  const std::string outDir = "output_files/";
+  const std::string biasV = "180V";
+  const std::string outDir = "output_files_1000MIPs/";
   std::filesystem::create_directories(outDir);
 
   std::cout << "Starting overlay run with " << nMips << " MIPs." << std::endl;
@@ -42,12 +36,9 @@ int main(int argc, char* argv[]) {
   if (!cmp.InitialiseSilvaco(file)) return 1;
 
   MediumSilicon si;
-  si.SetTemperature(300);
+  si.SetTemperature(293.15);
   si.SetImpactIonisationModelOkutoCrowell();
-
-  for (unsigned int i = 0; i < cmp.GetNumberOfRegions(); ++i) {
-    cmp.SetMedium(i, &si);
-  }
+  cmp.SetMedium(0, &si);
   cmp.SetRangeZ(-5.e-4, 5.e-4);
 
   // Get Bounding Box
@@ -57,40 +48,58 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  // Find active silicon depth (yTop to yBot)
   double yTop = 1., yBot = -1., eMax = 0., yGain = 0.;
-  const double x0 = 20.13e-4; // Central track position
+  const double kActiveFieldMinVcm = 100.;
+  // const double x0 = 250.13e-4;
+    const double x0 = 20.13e-4;
   for (int i = 0; i <= 400; ++i) {
     const double y = by0 + ((by1 - by0) * i) / 400.;
     double ex, ey, ez, v; int st; Medium* m = nullptr;
     cmp.ElectricField(x0, y, 0., ex, ey, ez, v, m, st);
-    if (st != 0) continue; 
+    if (st != 0) continue;
+    const double e = std::sqrt(ex * ex + ey * ey);
+    if (e < kActiveFieldMinVcm) continue;
     if (yTop > yBot) yTop = y;
     yBot = y;
-    const double e = std::sqrt(ex * ex + ey * ey);
     if (e > eMax) { eMax = e; yGain = y; }
   }
   const double d = yBot - yTop;
+  std::cout << "Track at x = " << x0 * 1.e4 << " um" << std::endl;
   std::cout << "Active silicon thickness: " << d * 1.e4 << " um" << std::endl;
   std::cout << "Peak field " << eMax << " V/cm at y = " << yGain * 1.e4 << " um" << std::endl;
 
-  // Linear Weighting Field Approximation
-  ComponentConstant wcmp;
-  wcmp.SetArea(bx0, yTop, -5.e-4, bx1, yBot, 5.e-4);
-  wcmp.SetMedium(&si);
-  wcmp.SetElectricField(0., 0., 0.);
-  wcmp.SetWeightingField(0., 1. / d, 0., "pad");
-  wcmp.SetWeightingPotential(0.5 * (bx0 + bx1), yTop, 0., 1.);
+  // strips
+  // const std::vector<Strip> strips = {
+  //   {"strip0",  50., 20.},
+  //   {"strip1", 245., 25.},
+  //   {"strip2", 450., 20.},
+  // };
+  const std::vector<Strip> strips = {
+    {"anode",  22.5, 22.5},
+    {"cathode", 77.5, 22.5},
+  };
+  if (!StripsInsideMap(strips, bx0, bx1)) return 1;
+  const std::size_t nStrips = strips.size();
+
+  ComponentAnalyticField wcmp;
+  wcmp.AddPlaneY(yTop, 1., "top");
+  wcmp.AddPlaneY(yBot, 0., "back");
+  for (const auto& s : strips) {
+    const double xc = s.centerUm * 1.e-4, hw = s.halfWidthUm * 1.e-4;
+    wcmp.AddStripOnPlaneY('z', yTop, xc - hw, xc + hw, s.label);
+  }
+
+  PrintWeightingSanity(wcmp, strips, yTop, yBot);
 
   const double yFine = yGain + 2.5e-4;
 
   // HEED
   std::cout << "\nPhase 1: Generating " << nMips << " tracks sequentially (HEED)..." << std::endl;
-  
+
   SolidBox box(0.5 * (bx0 + bx1), 0.5 * (yTop + yBot), 0., 0.5 * (bx1 - bx0), 0.5 * d, 5.e-4);
   GeometrySimple geo;
   geo.AddSolid(&box, &si);
-  
+
   ComponentConstant cmpHeed;
   cmpHeed.SetGeometry(&geo);
   cmpHeed.SetElectricField(0., 100., 0.);
@@ -101,7 +110,7 @@ int main(int argc, char* argv[]) {
   TrackHeed track;
   track.SetSensor(&heedSensor);
   track.SetParticle("pi");
-  track.SetMomentum(180.e9); 
+  track.SetMomentum(180.e9);
 
   // Store primary coordinates
   std::vector<std::vector<std::array<double, 4>>> allPrimaries(nMips);
@@ -116,21 +125,90 @@ int main(int argc, char* argv[]) {
   }
   std::cout << "Phase 1 complete. Proceeding to Avalanche simulation." << std::endl;
 
-  // OpenMP avalanche loop
-  std::vector<std::vector<double>> allSignals(nMips, std::vector<double>(800, 0.));
+  // process the biggest (slowest) tracks first: with dynamic scheduling,
+  // a large track that lands late on an already-busy thread becomes a
+  // lone straggler holding up the whole batch at the end. This only
+  // reorders which track index a thread works on, not the physics.
+  std::vector<int> trackOrder(nMips);
+  for (int i = 0; i < nMips; ++i) trackOrder[i] = i;
+  std::sort(trackOrder.begin(), trackOrder.end(), [&](int a, int b) {
+    return allPrimaries[a].size() > allPrimaries[b].size();
+  });
+
+  // OpenMP avalanche loop -- [strip][track][bin]
+  std::vector<std::vector<std::vector<double>>> allSignals(
+      nStrips, std::vector<std::vector<double>>(nMips,
+                                                std::vector<double>(800, 0.)));
+  std::vector<std::vector<std::vector<double>>> allSignalsOff(
+      nStrips, std::vector<std::vector<double>>(nMips,
+                                                std::vector<double>(800, 0.)));
+
   std::cout << "\nPhase 2: Starting " << nMips << " MIP avalanches across 8 cores..." << std::endl;
   std::cout << "(Silencing Garfield++ OpenMP oversubscription warnings...)" << std::endl;
-  const auto tOverlayStart = Clock::now();
 
   std::ofstream devNull("/dev/null");
   std::streambuf* oldCerr = std::cerr.rdbuf(devNull.rdbuf());
+
+  // gain-OFF reference pass: same primaries, no multiplication. Far
+  // cheaper than the ON pass (no cascade), so it runs first.
+  std::cout << "\nPhase 2a: gain-OFF reference pass..." << std::endl;
+  const auto tOffStart = Clock::now();
+
+  #pragma omp parallel
+  {
+    Sensor localSensor;
+    localSensor.AddComponent(&cmp);
+    for (const auto& s : strips) localSensor.AddElectrode(&wcmp, s.label);
+    localSensor.SetTimeWindow(0., 0.005, 800);
+    localSensor.SetArea(bx0, yTop + 0.02e-4, -5.e-4, bx1, yBot, 5.e-4);
+
+    AvalancheMC localAval;
+    localAval.EnableMultithreading(false);
+    localAval.SetSensor(&localSensor);
+    localAval.EnableSignalCalculation();
+    localAval.EnableMultiplication(false);
+    localAval.SetTimeWindow(0., 6.);
+    localAval.EnableAvalancheSizeLimit(5000);
+    localAval.SetStepDistanceFunction([yFine](double x, double y, double z) {
+      if (y < yFine) return 5.e-6 ;
+      return 2.5e-5;
+    });
+
+    #pragma omp for schedule(dynamic, 1)
+      for (int k = 0; k < nMips; ++k) {
+        const int iTrk = trackOrder[k];
+        localSensor.ClearSignal();
+        for (const auto& p : allPrimaries[iTrk]) {
+          localAval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
+        }
+        for (std::size_t is = 0; is < nStrips; ++is) {
+          for (unsigned int i = 0; i < 800; ++i) {
+            allSignalsOff[is][iTrk][i] =
+                localSensor.GetSignal(strips[is].label, i);
+          }
+        }
+        #pragma omp critical
+        {
+          std::cout << "  [OFF] Track " << iTrk + 1 << "/" << nMips
+                    << " (pairs=" << allPrimaries[iTrk].size() << ")"
+                    << " | Elapsed: " << ElapsedS(tOffStart) << " s"
+                    << std::endl;
+        }
+      }
+  }
+  std::cout << "Phase 2a complete: " << ElapsedS(tOffStart) << " s"
+            << std::endl;
+
+  // gain-ON pass
+  std::cout << "\nPhase 2b: gain-ON pass..." << std::endl;
+  const auto tOverlayStart = Clock::now();
 
   #pragma omp parallel
   {
     // Thread-local sensor and avalanche objects
     Sensor localSensor;
     localSensor.AddComponent(&cmp);
-    localSensor.AddElectrode(&wcmp, "pad");
+    for (const auto& s : strips) localSensor.AddElectrode(&wcmp, s.label);
     localSensor.SetTimeWindow(0., 0.005, 800);
     localSensor.SetArea(bx0, yTop + 0.02e-4, -5.e-4, bx1, yBot, 5.e-4);
 
@@ -139,13 +217,18 @@ int main(int argc, char* argv[]) {
     localAval.SetSensor(&localSensor);
     localAval.EnableSignalCalculation();
     localAval.EnableMultiplication(true);
+    // signal window is 4ns (800 x 0.005); without a drift bound a carrier
+    // in a near-zero-field pocket (e.g. the entry layer) drifts forever
+    localAval.SetTimeWindow(0., 6.);
+    localAval.EnableAvalancheSizeLimit(5000);
     localAval.SetStepDistanceFunction([yFine](double x, double y, double z) {
-      if (y < yFine) return 2.e-6; 
+      if (y < yFine) return 5.e-6 ;
       return 2.5e-5;
     });
 
     #pragma omp for schedule(dynamic, 1)
-      for (int iTrk = 0; iTrk < nMips; ++iTrk) {
+      for (int k = 0; k < nMips; ++k) {
+        const int iTrk = trackOrder[k];
         localSensor.ClearSignal();
 
         int nOk = 0, nFail = 0;
@@ -154,21 +237,17 @@ int main(int argc, char* argv[]) {
           if (ok) ++nOk; else ++nFail;
         }
 
-        double sigSum = 0.;
-        for (unsigned int i = 0; i < 800; ++i) {
-          allSignals[iTrk][i] = localSensor.GetSignal("pad", i);
-          sigSum += std::abs(allSignals[iTrk][i]);
+        for (std::size_t is = 0; is < nStrips; ++is) {
+          for (unsigned int i = 0; i < 800; ++i) {
+            allSignals[is][iTrk][i] =
+                localSensor.GetSignal(strips[is].label, i);
+          }
         }
 
         #pragma omp critical
         {
-          std::cout << "  Track " << iTrk + 1 << "/" << nMips
+          std::cout << "  [ON] Track " << iTrk + 1 << "/" << nMips
                     << " pairs=" << allPrimaries[iTrk].size()
-                    // << " ok=" << nOk << " fail=" << nFail
-                    // << " endpointsE=" << localAval.GetNumberOfElectronEndpoints()
-                    // << " endpointsH=" << localAval.GetHoles().size()
-                    // << " |signal|_sum=" << sigSum
-                    // << " | Thread " << omp_get_thread_num()
                     << " | Elapsed: " << ElapsedS(tOverlayStart) << " s"
                     << std::endl;
         }
@@ -177,27 +256,33 @@ int main(int argc, char* argv[]) {
 
   std::cerr.rdbuf(oldCerr);
 
-  //csv
-  std::ofstream fsig(outDir + "signal_overlay" + biasV + ".csv");
-  fsig << "time_ns";
-  for (int iTrk = 0; iTrk < nMips; ++iTrk) fsig << ",trk" << iTrk;
-  fsig << "\n";
-
-  fsig << "nPairs";
-  for (int iTrk = 0; iTrk < nMips; ++iTrk){
-    fsig << "," << allPrimaries[iTrk].size();
-  }
-  fsig << "\n";
-
-  for (unsigned int i = 0; i < 800; ++i) {
-    fsig << (i + 0.5) * 0.005;
-    for (int iTrk = 0; iTrk < nMips; ++iTrk) {
-      fsig << "," << allSignals[iTrk][i];
+  // one CSV per strip per pass, same format as before so the existing
+  // notebook loader works unchanged
+  for (std::size_t is = 0; is < nStrips; ++is) {
+    for (int pass = 0; pass < 2; ++pass) {
+      const auto& sig = (pass == 0) ? allSignals[is] : allSignalsOff[is];
+      const std::string tag = (pass == 0) ? "" : "_noGain";
+      const std::string path =
+          outDir + "signal_overlay" + tag + "_" + strips[is].label + biasV
+          + ".csv";
+      std::ofstream f(path);
+      f << "time_ns";
+      for (int iTrk = 0; iTrk < nMips; ++iTrk) f << ",trk" << iTrk;
+      f << "\n";
+      f << "nPairs";
+      for (int iTrk = 0; iTrk < nMips; ++iTrk) {
+        f << "," << allPrimaries[iTrk].size();
+      }
+      f << "\n";
+      for (unsigned int i = 0; i < 800; ++i) {
+        f << (i + 0.5) * 0.005;
+        for (int iTrk = 0; iTrk < nMips; ++iTrk) f << "," << sig[iTrk][i];
+        f << "\n";
+      }
+      std::cout << "wrote " << path << std::endl;
     }
-    fsig << "\n";
   }
-  
-  std::cout << "\nOverlay CSV written to " << outDir << "signal_overlay" + biasV + ".csv" << std::endl;
+
   std::cout << "TOTAL RUNTIME: " << ElapsedS(tRunStart) << " s" << std::endl;
   return 0;
 }

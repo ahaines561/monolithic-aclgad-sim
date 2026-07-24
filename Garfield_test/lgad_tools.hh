@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -33,7 +35,7 @@ bool StripsInsideMap(const std::vector<Strip>& strips, double bx0,
 
 void ScanValidity(Garfield::Component& cmp, double x0, double x1,
                   double y0, double y1, int nx, int ny,
-                  const std::string& csvPath);
+                  const std::string& csvPath, double eps = 0.013e-4);
 
 struct FieldProfile {
   double yTop = 0., yBot = 0., d = 0., yGain = 0., eMax = 0.;
@@ -47,7 +49,8 @@ diagnostics (active silicon bounds, peak field, low-field NOTE, or the
 
 FieldProfile ScanFieldProfile(Garfield::Component& cmp, double x0,
                               double y0, double y1, int nScan,
-                              const std::string& csvPath);
+                              const std::string& csvPath,
+                              double eMinVcm = 100.);
 
 struct FieldDumpResult {
   std::size_t nRows = 0, nBad = 0;
@@ -93,6 +96,38 @@ void DumpWeightingField(Garfield::ComponentAnalyticField& wcmp,
                         double bx1, double yTop, double yBot,
                         const std::string& outPath, int nx = 250,
                         int ny = 150);
+
+/* parallel avalanche pass (OpenMP)
+- one Sensor + one AvalancheMC per thread; only the read-only field
+  components are shared. Mirrors the pattern proven in 1000MIPs.cpp.
+- per-thread signals are summed at the end (induced signals are additive)
+- returns total electrons after multiplication
+- compiles and runs correctly WITHOUT -fopenmp (pragmas ignored, serial) */
+struct AvalanchePassConfig {
+  double fineStepCm = 5.e-6, bulkStepCm = 2.5e-5;
+  double yFineLoCm = 0., yFineHiCm = 0.;
+  double timeWindowNs = 4.;
+  std::size_t sizeCap = 5000;
+  bool multiplication = true;
+  double xMin = 0., yMin = 0., zMin = 0., xMax = 0., yMax = 0., zMax = 0.;
+  double tStart = 0., tStep = 0.005;
+  unsigned int nBins = 800;
+  // Garfield warns once per avalanche that it is running
+  // single-threaded inside an OpenMP region (which is the intended
+  // behaviour) -- hundreds of lines. Silencing also hides genuine
+  // stderr warnings such as "not in a valid drift region".
+  bool silenceGarfieldStderr = true;
+};
+
+unsigned long RunAvalanchePass(
+    Garfield::Component& driftCmp,
+    Garfield::ComponentAnalyticField& wcmp,
+    const std::vector<Strip>& strips,
+    const std::vector<std::array<double, 4>>& primaries,
+    const AvalanchePassConfig& pc,
+    std::vector<std::vector<double>>& signalOut,
+    std::ofstream* pairsCsv, unsigned long printEvery,
+    const std::string& tag);
 
 /* convergence scan
 G_e/G_eh vs step size at a fixed injection point; avalLadder must
