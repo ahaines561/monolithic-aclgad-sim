@@ -482,149 +482,294 @@ void RunConvergenceScan(AvalancheMC& avalLadder, double& stepCm, double x0,
   }
 }
 
-/* impact-ionisation model comparison
-- G_e/G_eh for vodm/okuto/massey/grant at one step size and injection point
-- writes eh/ge_sizes*.txt and appends to results.csv
-- Caller must reset si's model afterward. */
-void RunModelComparison(AvalancheMC& avalLadder, MediumSilicon& si,
-                        double x0, double yInj, double stepCm,
-                        std::size_t ladderCap, const std::string& outDir,
-                        const std::string& biasLabel, double eMax,
-                        double gMax) {
-  const char* cmpModels[] = {"vodm", "okuto", "massey", "grant"};
-  const int nCmpModels = 4;
+/* impact-ionisation feedback comparison
+- Runs explicit seed/feedback modes for the requested models.
+- Uses adaptive statistics so heavy-tailed modes receive more events.
+- Writes v2 CSV files rather than appending a new schema to legacy results. */
+void RunModelComparison(
+    AvalancheMC& avalLadder, MediumSilicon& si, double x0, double yInj,
+    double stepCm, std::size_t ladderCap, const std::string& outDir,
+    const std::string& biasLabel, double eMax, double gMax,
+    const FeedbackScanConfig& cfg) {
+  struct SeedResult {
+    double meanNe = 0.;
+    double semNe = 0.;
+    double relativeSemNe = 0.;
+    double medianNe = 0.;
+    double meanNh = 0.;
+    double semNh = 0.;
+    double noiseFNe = 0.;
+    std::size_t maxNe = 0;
+    std::size_t maxNh = 0;
+    int nCapped = 0;
+    int nFailed = 0;
+    int nDone = 0;
+    bool capLimited = false;
+    bool precisionReached = false;
+    std::string status = "NOT_RUN";
+    std::vector<std::size_t> neValues;
+    std::vector<std::size_t> nhValues;
+  };
+
   struct ModelResult {
-    double ge = 0., geSem = 0., geMed = 0., geh = 0., gehSem = 0., F = 0.,
-           med = 0.;
-    int nCapEh = 0, nEh = 0;
-    bool divergent = false;
-  } cmpRes[4];
+    SeedResult eNoHoles;
+    SeedResult eFull;
+    SeedResult hFull;
+    SeedResult ehFull;
+  };
 
-  const auto tCmpStart = Clock::now();
-  std::cout << "# model comparison: fine step = " << stepCm * 1.e7
-            << " nm, cap = " << ladderCap << std::endl;
-  for (int im = 0; im < nCmpModels; ++im) {
-    const std::string m = cmpModels[im];
-    if (m == "massey") {
+  if (cfg.models.empty()) {
+    std::cerr << "RunModelComparison: no models requested.\n";
+    return;
+  }
+  if (cfg.minEvents <= 0 || cfg.maxEvents < cfg.minEvents ||
+      cfg.batchSize <= 0 || cfg.targetRelativeSem <= 0.) {
+    std::cerr << "RunModelComparison: invalid FeedbackScanConfig.\n";
+    return;
+  }
+
+  const auto setModel = [&](const std::string& model) -> bool {
+    if (model == "massey") {
       si.SetImpactIonisationModelMassey();
-    } else if (m == "okuto") {
+    } else if (model == "okuto") {
       si.SetImpactIonisationModelOkutoCrowell();
-    } else if (m == "grant") {
+    } else if (model == "grant") {
       si.SetImpactIonisationModelGrant();
-    } else {
+    } else if (model == "vodm") {
       si.SetImpactIonisationModelVanOverstraetenDeMan();
+    } else {
+      std::cerr << "Unknown impact-ionisation model: " << model << "\n";
+      return false;
     }
-    ModelResult& r = cmpRes[im];
-    const auto tGeStart = Clock::now();
-    double sum = 0., sum2 = 0.;
-    const int nWantE = 200;
-    std::vector<std::size_t> geSizes;
-    for (int i = 0; i < nWantE; ++i) {
-      const double xi = x0 + (i % 5 - 2) * 2.e-4;
-      avalLadder.AvalancheElectron(xi, yInj, 0., 0.);
-      std::size_t ne = 0, ni = 0;
-      avalLadder.GetAvalancheSize(ne, ni);
-      sum += ne;
-      sum2 += double(ne) * double(ne);
-      geSizes.push_back(ne);
-    }
-    r.ge = sum / nWantE;
-    {
-      const double var = sum2 / nWantE - r.ge * r.ge;
-      r.geSem = std::sqrt(var > 0. ? var / nWantE : 0.);
-    }
-    r.geMed = MedianOf(geSizes);
-    std::cout << m << "   G_e  = " << r.ge << " +- " << r.geSem
-              << " (N=" << nWantE << ", median=" << r.geMed << ")  [timer] "
-              << ElapsedS(tGeStart) << " s" << std::endl;
+    return true;
+  };
 
-    const auto tEhStart = Clock::now();
-    sum = 0.;
-    sum2 = 0.;
-    std::vector<std::size_t> mSizes;
-    const int nWantEh = 300;
-    for (int i = 0; i < nWantEh; ++i) {
-      if (i % 50 == 0) std::cout << "  e+h injection " << i << std::endl;
-      const double xi = x0 + (i % 5 - 2) * 2.e-4;
-      avalLadder.AvalancheElectronHole(xi, yInj, 0., 0.);
-      std::size_t ne = 0, ni = 0;
-      avalLadder.GetAvalancheSize(ne, ni);
-      sum += ne;
-      sum2 += double(ne) * double(ne);
-      mSizes.push_back(ne);
-      if (ne >= ladderCap) ++r.nCapEh;
-      const bool hardTrip = r.nCapEh >= 6 && r.nCapEh * 5 > i + 1;
-      const bool softTrip = i == 49 && r.nCapEh * 10 > 50;
+  const auto suffix = [&](const std::string& model,
+                          const std::string& mode) {
+    const std::string bias = biasLabel == "NA" ? "" : "_" + biasLabel + "V";
+    return "feedback_" + model + "_" + mode + bias + ".txt";
+  };
+
+  const auto writeSizes = [&](const std::string& model,
+                              const std::string& mode,
+                              const std::vector<std::size_t>& values) {
+    std::ofstream f(outDir + suffix(model, mode));
+    for (const auto value : values) f << value << "\n";
+  };
+
+  const auto finalise = [&](SeedResult& r) {
+    if (r.nDone <= 0) {
+      r.status = "NO_EVENTS";
+      return;
+    }
+
+    double sumNe = 0., sumNe2 = 0., sumNh = 0., sumNh2 = 0.;
+    for (int i = 0; i < r.nDone; ++i) {
+      const double ne = static_cast<double>(r.neValues[i]);
+      const double nh = static_cast<double>(r.nhValues[i]);
+      sumNe += ne;
+      sumNe2 += ne * ne;
+      sumNh += nh;
+      sumNh2 += nh * nh;
+    }
+
+    r.meanNe = sumNe / r.nDone;
+    r.meanNh = sumNh / r.nDone;
+    const double varNe =
+        std::max(0., sumNe2 / r.nDone - r.meanNe * r.meanNe);
+    const double varNh =
+        std::max(0., sumNh2 / r.nDone - r.meanNh * r.meanNh);
+    r.semNe = std::sqrt(varNe / r.nDone);
+    r.semNh = std::sqrt(varNh / r.nDone);
+    r.relativeSemNe = r.meanNe > 0. ? r.semNe / r.meanNe : 0.;
+    r.medianNe = MedianOf(r.neValues);
+    r.noiseFNe = r.meanNe > 0.
+        ? (sumNe2 / r.nDone) / (r.meanNe * r.meanNe) : 0.;
+    r.precisionReached =
+        r.meanNe == 0. || r.relativeSemNe <= cfg.targetRelativeSem;
+
+    if (r.capLimited) {
+      r.status = "CAP_LIMITED";
+    } else if (!r.precisionReached) {
+      r.status = r.noiseFNe >= cfg.heavyTailThresholdF
+          ? "HEAVY_TAIL_UNRESOLVED" : "PRECISION_NOT_REACHED";
+    } else if (r.noiseFNe >= cfg.heavyTailThresholdF) {
+      r.status = "CONVERGED_HEAVY_TAIL";
+    } else {
+      r.status = "CONVERGED";
+    }
+  };
+
+  const auto runSeedMode = [&](const std::string& label, auto&& launch) {
+    SeedResult r;
+    r.neValues.reserve(cfg.maxEvents);
+    r.nhValues.reserve(cfg.maxEvents);
+    const auto tStart = Clock::now();
+
+    double sumNe = 0.;
+    double sumNe2 = 0.;
+
+    for (int i = 0; i < cfg.maxEvents; ++i) {
+      const bool ok = launch(x0);
+      if (!ok) ++r.nFailed;
+
+      std::size_t ne = 0, nh = 0;
+      avalLadder.GetAvalancheSize(ne, nh);
+      r.neValues.push_back(ne);
+      r.nhValues.push_back(nh);
+      r.maxNe = std::max(r.maxNe, ne);
+      r.maxNh = std::max(r.maxNh, nh);
+      ++r.nDone;
+
+      const double dne = static_cast<double>(ne);
+      sumNe += dne;
+      sumNe2 += dne * dne;
+
+      if (ne >= ladderCap || nh >= ladderCap) ++r.nCapped;
+
+      // Abort clearly cap-limited feedback branches before spending many
+      // minutes sampling a quantity whose mean is set by the artificial cap.
+      const bool hardTrip = r.nCapped >= 6 && r.nCapped * 5 > r.nDone;
+      const bool softTrip = r.nDone >= 50 && r.nCapped * 10 > r.nDone;
       if (hardTrip || softTrip) {
-        r.divergent = true;
-        std::cout << m << ": " << r.nCapEh << "/" << (i + 1)
-                  << " e+h avalanches hit the cap -- hole-feedback "
-                  << "divergence (f >= 1) at this bias; G_eh undefined, "
-                  << "aborting this model's e+h pass." << std::endl;
+        r.capLimited = true;
+        std::cout << label << ": " << r.nCapped << "/" << r.nDone
+                  << " events reached the avalanche cap; aborting mode.\n";
         break;
       }
+
+      const bool checkpoint =
+          r.nDone >= cfg.minEvents &&
+          (r.nDone % cfg.batchSize == 0 || r.nDone == cfg.maxEvents);
+      if (checkpoint) {
+        const double mean = sumNe / r.nDone;
+        const double var = std::max(0., sumNe2 / r.nDone - mean * mean);
+        const double sem = std::sqrt(var / r.nDone);
+        const double relSem = mean > 0. ? sem / mean : 0.;
+        if (mean == 0. || relSem <= cfg.targetRelativeSem) break;
+      }
     }
-    r.nEh = int(mSizes.size());
-    r.geh = sum / r.nEh;
-    {
-      const double var = sum2 / r.nEh - r.geh * r.geh;
-      r.gehSem = std::sqrt(var > 0. ? var / r.nEh : 0.);
+
+    finalise(r);
+    std::cout << label
+              << "   <Ne>=" << r.meanNe << " +- " << r.semNe
+              << " (relSEM=" << 100. * r.relativeSemNe << "%, median="
+              << r.medianNe << ")"
+              << "   <Nh>=" << r.meanNh << " +- " << r.semNh
+              << "   F_e=" << r.noiseFNe
+              << "   max=(" << r.maxNe << "," << r.maxNh << ")"
+              << "   capped=" << r.nCapped << "/" << r.nDone
+              << "   failed=" << r.nFailed
+              << "   status=" << r.status
+              << "   [timer] " << ElapsedS(tStart) << " s\n";
+    return r;
+  };
+
+  avalLadder.EnableMultiplication(true);
+  std::vector<ModelResult> results(cfg.models.size());
+  const auto tCmpStart = Clock::now();
+
+  std::cout << "# feedback comparison: fine step = " << stepCm * 1.e7
+            << " nm, cap = " << ladderCap
+            << ", min/max events = " << cfg.minEvents << "/"
+            << cfg.maxEvents
+            << ", target relative SEM = " << 100. * cfg.targetRelativeSem
+            << "%\n";
+  std::cout << "# Note: in e_no_holes, generated holes are included in Nh "
+               "but are not transported.\n";
+
+  for (std::size_t im = 0; im < cfg.models.size(); ++im) {
+    const std::string& model = cfg.models[im];
+    if (!setModel(model)) continue;
+    std::cout << "\n## model = " << model << "\n";
+
+    ModelResult& r = results[im];
+    r.eNoHoles = runSeedMode(model + " e_no_holes", [&](double xi) {
+      return avalLadder.AvalancheElectron(xi, yInj, 0., 0., false);
+    });
+    r.eFull = runSeedMode(model + " e_full", [&](double xi) {
+      return avalLadder.AvalancheElectron(xi, yInj, 0., 0., true);
+    });
+    if (cfg.runHoleSeed) {
+      r.hFull = runSeedMode(model + " h_full", [&](double xi) {
+        return avalLadder.AvalancheHole(xi, yInj, 0., 0., true);
+      });
     }
-    {
-      double m1 = 0., m2 = 0.;
-      for (const auto s : mSizes) { m1 += s; m2 += double(s) * double(s); }
-      m1 /= r.nEh;
-      m2 /= r.nEh;
-      r.F = m1 > 0. ? m2 / (m1 * m1) : 0.;
-      r.med = MedianOf(mSizes);
+    if (cfg.runPairSeed) {
+      r.ehFull = runSeedMode(model + " eh_full", [&](double xi) {
+        return avalLadder.AvalancheElectronHole(xi, yInj, 0., 0.);
+      });
     }
-    if (!r.divergent && r.nCapEh * 10 > r.nEh) r.divergent = true;
-    std::cout << m << "   G_eh = " << r.geh << " +- " << r.gehSem
-              << " (N=" << r.nEh << ", median=" << r.med << ", capped="
-              << r.nCapEh << (r.divergent ? ", DIVERGENT" : "")
-              << ")   F = " << r.F << "  [timer] " << ElapsedS(tEhStart)
-              << " s" << std::endl;
-    std::ofstream fs(outDir + (biasLabel == "NA" ? ("eh_sizes_" + m + ".txt")
-                                        : ("eh_sizes_" + m + "_" + biasLabel
-                                           + "V.txt")));
-    for (const auto s : mSizes) fs << s << "\n";
-    std::ofstream fge(outDir + (biasLabel == "NA" ? ("ge_sizes_" + m + ".txt")
-                                         : ("ge_sizes_" + m + "_" + biasLabel
-                                            + "V.txt")));
-    for (const auto s : geSizes) fge << s << "\n";
-  }
-  std::cout << "[timer] model comparison: " << ElapsedS(tCmpStart)
-            << " s" << std::endl;
-  std::cout << "\n# model   G_e (median)         G_eh             median   F"
-            << "      status" << std::endl;
-  for (int im = 0; im < nCmpModels; ++im) {
-    const ModelResult& r = cmpRes[im];
-    std::cout << cmpModels[im] << "   " << r.ge << " +- " << r.geSem
-              << " (" << r.geMed << ")"
-              << "   " << r.geh << " +- " << r.gehSem << "   " << r.med
-              << "   " << r.F << "   "
-              << (r.divergent ? "DIVERGENT (G_eh unreliable)" : "ok")
-              << std::endl;
+
+    writeSizes(model, "e_no_holes_ne", r.eNoHoles.neValues);
+    writeSizes(model, "e_full_ne", r.eFull.neValues);
+    if (cfg.runHoleSeed) {
+      writeSizes(model, "h_full_ne", r.hFull.neValues);
+      writeSizes(model, "h_full_nh", r.hFull.nhValues);
+    }
+    if (cfg.runPairSeed) {
+      writeSizes(model, "eh_full_ne", r.ehFull.neValues);
+    }
   }
 
-  {
-    std::ifstream ftest(outDir + "results.csv");
-    const bool exists = ftest.good();
-    ftest.close();
-    std::ofstream fres(outDir + "results.csv", std::ios::app);
-    if (!exists) {
-      fres << "bias,model,Epeak_line_Vcm,Epeak_global_Vcm,Ge,GeSem,Geh,"
-           << "GehSem,median,F,nCapEh,N,divergent,GeMedian\n";
-    }
-    for (int im = 0; im < nCmpModels; ++im) {
-      const ModelResult& r = cmpRes[im];
-      fres << biasLabel << "," << cmpModels[im] << "," << eMax << ","
-           << gMax << "," << r.ge << "," << r.geSem << "," << r.geh << ","
-           << r.gehSem << "," << r.med << "," << r.F << "," << r.nCapEh
-           << "," << r.nEh << "," << (r.divergent ? 1 : 0) << ","
-           << r.geMed << "\n";
-    }
-    std::cout << "appended " << nCmpModels << " rows to results.csv "
-              << "(bias=" << biasLabel << ")" << std::endl;
+  const std::string detailPath = outDir + "feedback_results_v2.csv";
+  std::ofstream detail(detailPath);
+  detail << "bias,model,Epeak_line_Vcm,Epeak_global_Vcm,step_nm,cap,mode,"
+            "N,meanNe,semNe,relativeSemNe,medianNe,meanNh,semNh,FNe,"
+            "maxNe,maxNh,nCapped,nFailed,status\n";
+
+  const auto writeDetail = [&](const std::string& model,
+                               const std::string& mode,
+                               const SeedResult& r) {
+    detail << biasLabel << "," << model << "," << eMax << "," << gMax
+           << "," << stepCm * 1.e7 << "," << ladderCap << "," << mode
+           << "," << r.nDone << "," << r.meanNe << "," << r.semNe
+           << "," << r.relativeSemNe << "," << r.medianNe << ","
+           << r.meanNh << "," << r.semNh << "," << r.noiseFNe << ","
+           << r.maxNe << "," << r.maxNh << "," << r.nCapped << ","
+           << r.nFailed << "," << r.status << "\n";
+  };
+
+  const std::string summaryPath = outDir + "feedback_summary_v2.csv";
+  std::ofstream summary(summaryPath);
+  summary << "bias,model,eNoHoles,eFull,hFullNe,hFullNh,ehFull,"
+             "secondaryFeedbackRatio,initialHoleRatio,eNoHolesStatus,"
+             "eFullStatus,hFullStatus,ehFullStatus\n";
+
+  std::cout << "\n# model  e_no_holes  e_full  h_full<Ne>  h_full<Nh>"
+               "  eh_full  e_full/e_no_holes  eh_full/e_full  status\n";
+  for (std::size_t im = 0; im < cfg.models.size(); ++im) {
+    const auto& model = cfg.models[im];
+    const auto& r = results[im];
+    writeDetail(model, "e_no_holes", r.eNoHoles);
+    writeDetail(model, "e_full", r.eFull);
+    if (cfg.runHoleSeed) writeDetail(model, "h_full", r.hFull);
+    if (cfg.runPairSeed) writeDetail(model, "eh_full", r.ehFull);
+
+    const double secondaryFeedback = r.eNoHoles.meanNe > 0.
+        ? r.eFull.meanNe / r.eNoHoles.meanNe : 0.;
+    const double initialHoleRatio =
+        cfg.runPairSeed && r.eFull.meanNe > 0.
+        ? r.ehFull.meanNe / r.eFull.meanNe : 0.;
+    const bool capLimited = r.eNoHoles.capLimited || r.eFull.capLimited ||
+        (cfg.runHoleSeed && r.hFull.capLimited) ||
+        (cfg.runPairSeed && r.ehFull.capLimited);
+
+    std::cout << model << "  " << r.eNoHoles.meanNe << "  "
+              << r.eFull.meanNe << "  " << r.hFull.meanNe << "  "
+              << r.hFull.meanNh << "  " << r.ehFull.meanNe << "  "
+              << secondaryFeedback << "  " << initialHoleRatio << "  "
+              << (capLimited ? "CAP_LIMITED" : r.eFull.status) << "\n";
+
+    summary << biasLabel << "," << model << "," << r.eNoHoles.meanNe
+            << "," << r.eFull.meanNe << "," << r.hFull.meanNe << ","
+            << r.hFull.meanNh << "," << r.ehFull.meanNe << ","
+            << secondaryFeedback << "," << initialHoleRatio << ","
+            << r.eNoHoles.status << "," << r.eFull.status << ","
+            << r.hFull.status << "," << r.ehFull.status << "\n";
   }
+
+  std::cout << "wrote " << detailPath << " and " << summaryPath << "\n";
+  std::cout << "[timer] feedback comparison: " << ElapsedS(tCmpStart)
+            << " s\n";
 }

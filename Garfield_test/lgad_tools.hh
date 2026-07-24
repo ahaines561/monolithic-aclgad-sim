@@ -137,13 +137,34 @@ void RunConvergenceScan(Garfield::AvalancheMC& avalLadder, double& stepCm,
                         const std::string& outDir);
 
 
-/* impact-ionisation model comparison
-- G_e/G_eh for vodm/okuto/massey/grant at one step size and injection point
-- writes eh/ge_sizes*.txt and appends to results.csv
-- Caller must reset si's model afterward. */
-void RunModelComparison(Garfield::AvalancheMC& avalLadder,
-                        Garfield::MediumSilicon& si, double x0,
-                        double yInj, double stepCm, std::size_t ladderCap,
-                        const std::string& outDir,
-                        const std::string& biasLabel, double eMax,
-                        double gMax);
+struct FeedbackScanConfig {
+  // Keep the default focused on the model used for the Garfield/Silvaco
+  // comparison. Add {"vodm", "massey", "grant"} only when desired.
+  std::vector<std::string> models = {"okuto"};
+
+  // Adaptive stopping: each mode runs at least minEvents and then stops once
+  // SEM / mean reaches targetRelativeSem. Heavy tails can force maxEvents.
+  int minEvents = 500;
+  int maxEvents = 5000;
+  int batchSize = 250;
+  double targetRelativeSem = 0.05;
+  double heavyTailThresholdF = 3.0;
+
+  bool runHoleSeed = true;
+  bool runPairSeed = true;
+};
+
+/* impact-ionisation feedback comparison
+- e_no_holes: electron seed; generated holes are counted but not transported
+- e_full: electron seed; generated holes are transported and may multiply
+- h_full: hole seed; generated electrons are transported
+- eh_full: primary electron-hole pair with full feedback
+- adaptive statistics and explicit heavy-tail/cap-limited statuses
+- writes feedback_results_v2.csv and feedback_summary_v2.csv
+- Caller must reset si's model afterward if a later MIP pass is requested. */
+void RunModelComparison(
+    Garfield::AvalancheMC& avalLadder, Garfield::MediumSilicon& si,
+    double x0, double yInj, double stepCm, std::size_t ladderCap,
+    const std::string& outDir, const std::string& biasLabel,
+    double eMax, double gMax,
+    const FeedbackScanConfig& cfg = FeedbackScanConfig{});

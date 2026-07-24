@@ -25,7 +25,7 @@ int main(int argc, char* argv[]) {
   // CLI Arguments
   const std::string file = argc > 1 ? argv[1] : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad190V.sta";
   const int nMips = argc > 2 ? std::atoi(argv[2]) : 200; //num of MIPs
-  const std::string biasV = "180V";
+  const std::string biasV = "190V";
   const std::string outDir = "output_files_1000MIPs/";
   std::filesystem::create_directories(outDir);
 

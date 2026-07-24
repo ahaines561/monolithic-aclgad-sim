@@ -25,16 +25,16 @@ struct RunConfig {
                         // "lgad150V.sta";
                         // "lgad180V.sta";
                         // "lgad190V.sta";
-                        // "aclgad.sta";
-                        "lgad_deepjte_180V_X80.sta";
-  std::string outDir = "output_files_150V/";
+                        "aclgad.sta";
+  std::string outDir = "output_files/";
 
   double biasVOverride = std::numeric_limits<double>::quiet_NaN();
-  double xTrackUm = 80.;  // MIP track position
-  bool doWeightingDump = true; // DumpWeightingField
-  bool doConvergenceScan = false;  // RunConvergenceScan
-  bool doModelComparison = true; // RunModelComparison
-  bool doMIP = true;
+  double xTrackUm = 250.;  // MIP track position
+  bool doWeightingDump = false; // DumpWeightingField
+  bool doConvergenceScan = false; // RunConvergenceScan
+  bool doModelComparison = true;  // four-mode feedback comparison
+  bool doMIP = false;             // diagnostic-only default
+  std::vector<unsigned int> siliconRegions = {0};
   std::string model = "okuto";
   double driftWindowNs = 4.; // must exceed the 4ns signal window
   double fineStepNm = 50.; // step size inside the gain-layer band
@@ -74,7 +74,15 @@ int main() {
                         cfg.model == "okuto"
                     ? cfg.model : "vodm (van Overstraeten-de Man)")
             << std::endl;
-  cmp.SetMedium(0, &si);
+  for (const auto i : cfg.siliconRegions) {
+    if (i >= cmp.GetNumberOfRegions()) {
+      std::cerr << "Requested silicon region " << i
+                << " but the map has only " << cmp.GetNumberOfRegions()
+                << " regions.\n";
+      return 1;
+    }
+    cmp.SetMedium(i, &si);
+  }
   cmp.SetRangeZ(-5.e-4, 5.e-4);
   cmp.PrintRegions();
 
@@ -211,15 +219,15 @@ int main() {
   }
 
   // strips canode/cathode
-  // const std::vector<Strip> strips = {
-  //   {"strip0",  50., 20.},
-  //   {"strip1", 245., 25.},
-  //   {"strip2", 450., 20.},
-  // };
   const std::vector<Strip> strips = {
-    {"anode",  22.5, 22.5},
-    {"cathode", 77.5, 22.5},
+    {"strip0",  50., 20.},
+    {"strip1", 245., 25.},
+    {"strip2", 450., 20.},
   };
+  // const std::vector<Strip> strips = {
+  //   {"anode",  22.5, 22.5},
+  //   {"cathode", 77.5, 22.5},
+  // };
   if (!StripsInsideMap(strips, bx0, bx1)) return 1;
 
   ComponentAnalyticField wcmp;
@@ -249,9 +257,14 @@ int main() {
   const double fineStepCm = cfg.fineStepNm * 1.e-7;   // nm -> cm
   const double bulkStepCm = cfg.bulkStepNm * 1.e-7;
   const double fineBandCm = cfg.fineBandHalfWidthUm * 1.e-4;
+  // clamp to the active region -- yGain+-fineBandCm can extend past
+  // yTop/yBot when the gain layer sits close to an edge
   const double yFineLo = std::max(yGain - fineBandCm, yTop);
   const double yFineHi = std::min(yGain + fineBandCm, yBot);
 
+  // the MIP avalanche objects are created per-thread inside
+  // RunAvalanchePass; only the ladder (convergence / model comparison)
+  // needs a long-lived AvalancheMC here
   const std::size_t sizeCap = 5000;
 
   const double yInj = std::min(yGain + 5.e-4, 0.5 * (yGain + yBot));
