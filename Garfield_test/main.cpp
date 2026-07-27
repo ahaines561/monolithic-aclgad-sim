@@ -6,6 +6,9 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <iomanip>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "Garfield/ComponentTcad2d.hh"
@@ -19,28 +22,215 @@
 
 using namespace Garfield;
 
+
+struct SignalMetrics {
+  std::vector<double> integral;
+  std::vector<double> peak;
+  double totalIntegral = 0.;
+  std::size_t peakStrip = 0;
+};
+
+static SignalMetrics MeasureSignal(
+    const std::vector<std::vector<double>>& signal) {
+  SignalMetrics r;
+  r.integral.assign(signal.size(), 0.);
+  r.peak.assign(signal.size(), 0.);
+  for (std::size_t k = 0; k < signal.size(); ++k) {
+    for (const double sample : signal[k]) {
+      r.integral[k] += sample;
+      if (std::abs(sample) > std::abs(r.peak[k])) r.peak[k] = sample;
+    }
+    r.totalIntegral += r.integral[k];
+    if (k > 0 && std::abs(r.peak[k]) > std::abs(r.peak[r.peakStrip])) {
+      r.peakStrip = k;
+    }
+  }
+  return r;
+}
+
+static std::string EventTag(const int eventId) {
+  std::ostringstream out;
+  out << "event" << std::setw(4) << std::setfill('0') << eventId;
+  return out.str();
+}
+
+struct SampleStats {
+  std::size_t n = 0;
+  double mean = std::numeric_limits<double>::quiet_NaN();
+  double sd = std::numeric_limits<double>::quiet_NaN();
+  double sem = std::numeric_limits<double>::quiet_NaN();
+};
+
+static SampleStats ComputeSampleStats(const std::vector<double>& values) {
+  SampleStats r;
+  r.n = values.size();
+  if (values.empty()) return r;
+  double sum = 0.;
+  for (const double x : values) sum += x;
+  r.mean = sum / static_cast<double>(values.size());
+  if (values.size() == 1) {
+    r.sd = 0.;
+    r.sem = 0.;
+    return r;
+  }
+  double ss = 0.;
+  for (const double x : values) {
+    const double d = x - r.mean;
+    ss += d * d;
+  }
+  r.sd = std::sqrt(ss / static_cast<double>(values.size() - 1));
+  r.sem = r.sd / std::sqrt(static_cast<double>(values.size()));
+  return r;
+}
+
+
+static void DumpCombinedFieldProfile(
+    Component& tcad, ComponentPoisson2d& screening,
+    const double xCm, const double yMinCm, const double yMaxCm,
+    const int nPoints, const std::string& path,
+    const bool announce = true) {
+  std::ofstream out(path);
+  if (!out) {
+    std::cerr << "Could not open combined-field profile " << path << "\n";
+    return;
+  }
+  out << "x_um,y_um,tcadEx_Vcm,tcadEy_Vcm,tcadEmag_Vcm,"
+         "scEx_Vcm,scEy_Vcm,scEmag_Vcm,combinedEx_Vcm,combinedEy_Vcm,"
+         "combinedEmag_Vcm,deltaEmag_Vcm,tcadStatus,scStatus\n";
+  const int n = std::max(2, nPoints);
+  for (int i = 0; i < n; ++i) {
+    const double y = yMinCm + (yMaxCm - yMinCm) * i / (n - 1);
+    double tx = 0., ty = 0., tz = 0., tv = 0.;
+    double sx = 0., sy = 0., sz = 0., sv = 0.;
+    Medium* tm = nullptr;
+    Medium* sm = nullptr;
+    int ts = 0, ss = 0;
+    tcad.ElectricField(xCm, y, 0., tx, ty, tz, tv, tm, ts);
+    screening.ElectricField(xCm, y, 0., sx, sy, sz, sv, sm, ss);
+    const double tmag = std::sqrt(tx * tx + ty * ty);
+    const double smag = std::sqrt(sx * sx + sy * sy);
+    const double cx = tx + sx;
+    const double cy = ty + sy;
+    const double cmag = std::sqrt(cx * cx + cy * cy);
+    out << xCm * 1.e4 << "," << y * 1.e4 << ","
+        << tx << "," << ty << "," << tmag << ","
+        << sx << "," << sy << "," << smag << ","
+        << cx << "," << cy << "," << cmag << ","
+        << (cmag - tmag) << "," << ts << "," << ss << "\n";
+  }
+  if (announce) std::cout << "wrote " << path << "\n";
+}
+
 struct RunConfig {
   std::string file = "/home/ahaines561/HEP/MAS/Silvaco_dat/"
                         // "diode.sta";
                         // "lgad150V.sta";
-                        // "lgad180V.sta";
+                        "lgad180V.sta";
                         // "lgad190V.sta";
-                        "aclgad.sta";
-  std::string outDir = "output_files/";
+                        // "aclgad.sta";
+  std::string outDir = "output_files_x20_2/";
 
   double biasVOverride = std::numeric_limits<double>::quiet_NaN();
-  double xTrackUm = 250.;  // MIP track position
-  bool doWeightingDump = false; // DumpWeightingField
-  bool doConvergenceScan = false; // RunConvergenceScan
-  bool doModelComparison = true;  // four-mode feedback comparison
-  bool doMIP = false;             // diagnostic-only default
-  std::vector<unsigned int> siliconRegions = {0};
+  double xTrackUm = 20.;  // MIP track position
+  bool doWeightingDump = true; // DumpWeightingField
+  bool doConvergenceScan = false;  // legacy G_e/G_eh step ladder
+  bool doFeedbackScan = false;     // explicit e_no_holes/e_full/h_full/eh_full
+  bool doModelComparison = false;  // deprecated alias for doFeedbackScan
+  bool doMIP = true;
+
+  // Multi-MIP ensemble controls. Every event uses one HEED primary list.
+  // Static and screened modes reuse that primary list but use distinct RNG
+  // seed families, so their ratio is not artificially coupled by plumbing.
+  int nMips = 1;  // temporary RNG replay diagnostic
+  int mipEventOffset = 0;
+  bool mipRunStatic = false;  // temporary RNG replay diagnostic
+  bool mipRunScreened = true;
+  bool mipWriteOverlaySignals = false;  // temporary RNG replay diagnostic
+  bool mipWritePerEventSignals = false;
+  bool mipWritePairFiles = false;
+  bool mipWritePrimaries = true;
+  int mipProgressEvery = 1;
+  unsigned long mipPairProgressEvery = 0;
+
+  // Re-seed immediately before TrackHeed::NewTrack so the same event ID
+  // produces the same primary list in every numerical scan.
+  bool mipDeterministicPrimaries = true;
+  unsigned long mipPrimarySeedBase = 1180000;
+
+  // Canonical pass determinism. Garfield RNG state is thread-local, so each
+  // avalanche pass installs its seed inside the executing OpenMP region.
+  // Serial execution is still required for bit-exact replay; offsets define
+  // disjoint seed families relative to scSeedBase.
+  bool mipDeterministicGainOff = true;
+  unsigned long mipGainOffSeedOffset = 100000UL;
+  bool mipDeterministicStatic = true;
+  unsigned long mipStaticSeedOffset = 200000UL;
+
+  // Optional frozen-field production sampling. Zero preserves the current
+  // runtime. When positive, K explicitly seeded serial samples are written
+  // for static and screened fields without updating the converged SC field.
+  int mipFinalSampleCount = 0;
+  bool mipFinalSampleEnableSignal = true;
+  unsigned long mipStaticSampleSeedOffset = 400000UL;
+  unsigned long mipScreenedSampleSeedOffset = 500000UL;
+  unsigned long mipFinalSampleEventStride = 1000UL;
+
+  bool silenceGarfieldSensorSetup = true;
+
   std::string model = "okuto";
+  double temperatureK = 293.15;
+
+  // Feedback-scan controls.
+  std::vector<std::string> feedbackModels = {};  // empty = use cfg.model
+  int feedbackMinEvents = 500;
+  int feedbackMaxEvents = 5000;
+  int feedbackBatchSize = 250;
+  double feedbackTargetRelativeSem = 0.05;
+  double feedbackHeavyTailThresholdF = 3.0;
+  double feedbackTimeWindowNs = 6.;
+  std::size_t feedbackSizeCap = 5000;
+  bool feedbackRunHoleSeed = true;
+  bool feedbackRunPairSeed = true;
+  bool dumpTownsendTables = true;
+
+  unsigned int siliconRegion = 0;
+  bool assignAllRegionsToSilicon = false;  // diagnostic escape hatch only
   double driftWindowNs = 4.; // must exceed the 4ns signal window
   double fineStepNm = 50.; // step size inside the gain-layer band
   double bulkStepNm = 250.;  // step size everywhere else
   double fineBandHalfWidthUm = 2.5;  // band = [yGain-this, yGain+this]
   double activeFieldMinVcm = 100.;
+
+  bool spaceCharge = true;  // master switch for the Poisson correction
+  double scZExtentUm = 0.21;
+  int scMaxIter = 12;
+  double scRelaxation = 0.25;     // robust for the field-only stopping rule
+  bool scDeterministic = true;    // serial iterations + fixed seed
+  unsigned long scSeedBase = 180000;
+
+  // Temporary gate for the serial same-seed avalanche replay test.
+  // Leave diagnosticOnly=true for the first run so the program exits after
+  // printing A/B and does not spend time on the normal SC iteration loop.
+  bool scReplayDiagnostic = true;
+  bool scReplayDiagnosticOnly = true;
+  bool scDeterministicFinal = true;  // serial canonical screened signal
+  unsigned long scFinalSeedOffset = 300000UL;
+  bool scWriteIterationHistory = true;
+  // 0 = quiet (only final per-event result), 1 = one line per iteration,
+  // 2 = detailed charge/field diagnostics.
+  int scConsoleVerbosity = 0;
+  double scGainTol = 0.01;  // diagnostic only; gain does not gate stopping
+  double scFieldTol = 0.01;
+  int scStableIterations = 3;
+  int scMixNx = 101;
+  int scMixNy = 501;
+  int scFieldSampleNx = 11;
+  int scFieldSampleNy = 41;
+  double scFieldSampleXHalfWidthUm = 5.;
+  double scFieldSampleYHalfWidthUm = 1.;
+  bool scWriteFinalFieldProfile = true;
+  int scFinalFieldProfilePoints = 801;
+  bool scFinalEvaluationPass = true;
 };
 
 int main() {
@@ -59,29 +249,30 @@ int main() {
   if (!cmp.InitialiseSilvaco(cfg.file)) return 1;
 
   MediumSilicon si;
-  si.SetTemperature(293.15);
-  if (cfg.model == "massey") {
-    si.SetImpactIonisationModelMassey();
-  } else if (cfg.model == "grant") {
-    si.SetImpactIonisationModelGrant();
-  } else if (cfg.model == "okuto") {
-    si.SetImpactIonisationModelOkutoCrowell();
-  } else {
-    si.SetImpactIonisationModelVanOverstraetenDeMan();
-  }
-  std::cout << "impact-ionisation model: "
-            << (cfg.model == "massey" || cfg.model == "grant" ||
-                        cfg.model == "okuto"
-                    ? cfg.model : "vodm (van Overstraeten-de Man)")
+  si.SetTemperature(cfg.temperatureK);
+  if (!SetImpactIonisationModel(si, cfg.model)) return 2;
+  std::cout << "impact-ionisation model: " << cfg.model
+            << ", temperature = " << cfg.temperatureK << " K"
             << std::endl;
-  for (const auto i : cfg.siliconRegions) {
-    if (i >= cmp.GetNumberOfRegions()) {
-      std::cerr << "Requested silicon region " << i
+
+  if (cmp.GetNumberOfRegions() == 0) {
+    std::cerr << "Field map contains no regions.\n";
+    return 1;
+  }
+  if (cfg.assignAllRegionsToSilicon) {
+    std::cout << "WARNING: assigning every imported region to silicon; "
+                 "use only for a controlled diagnostic.\n";
+    for (unsigned int i = 0; i < cmp.GetNumberOfRegions(); ++i) {
+      cmp.SetMedium(i, &si);
+    }
+  } else {
+    if (cfg.siliconRegion >= cmp.GetNumberOfRegions()) {
+      std::cerr << "Requested silicon region " << cfg.siliconRegion
                 << " but the map has only " << cmp.GetNumberOfRegions()
                 << " regions.\n";
       return 1;
     }
-    cmp.SetMedium(i, &si);
+    cmp.SetMedium(cfg.siliconRegion, &si);
   }
   cmp.SetRangeZ(-5.e-4, 5.e-4);
   cmp.PrintRegions();
@@ -183,51 +374,17 @@ int main() {
     std::cout << "[timer] full-device dump: " << ElapsedS(tFullStart)
               << " s" << std::endl;
   }
-  {
-    const auto tHeedStart = Clock::now();
-    SolidBox hbox(0.5 * (bx0 + bx1), 0.5 * (yTop + yBot), 0.,
-                  0.5 * (bx1 - bx0), 0.5 * d, 5.e-4);
-    GeometrySimple hgeo;
-    hgeo.AddSolid(&hbox, &si);
-    ComponentConstant hcmp;
-    hcmp.SetGeometry(&hgeo);
-    hcmp.SetElectricField(0., 100., 0.);
-    Sensor hsensor;
-    hsensor.AddComponent(&hcmp);
-    TrackHeed htrack;
-    htrack.SetSensor(&hsensor);
-    htrack.SetParticle("pi");
-    htrack.SetMomentum(180.e9);
-    const int nHeedTracks = 300;
-    std::ofstream fprim(cfg.outDir + (biasLabel == "NA" ? "primary_pairs.txt"
-        : ("primary_pairs_" + biasLabel + "V.txt")));
-    for (int it = 0; it < nHeedTracks; ++it) {
-      htrack.NewTrack(x0, yTop + 0.03e-4, 0., 0., 0., 1., 0.);
-      double xc, yc, zc, tc, ec, extra;
-      int nc = 0;
-      unsigned long nPrimary = 0;
-      while (htrack.GetCluster(xc, yc, zc, tc, nc, ec, extra)) {
-      nPrimary += nc;
-      }
-      fprim << nPrimary << "\n";
-    }
-    std::cout << "wrote " << nHeedTracks << " fast Heed tracks to "
-              << "primary_pairs" << (biasLabel == "NA" ? "" : "_" +
-                 biasLabel + "V") << ".txt" << std::endl;
-    std::cout << "[timer] Heed primary-statistics: "
-              << ElapsedS(tHeedStart) << " s" << std::endl;
-  }
 
   // strips canode/cathode
-  const std::vector<Strip> strips = {
-    {"strip0",  50., 20.},
-    {"strip1", 245., 25.},
-    {"strip2", 450., 20.},
-  };
-  // const std::vector<Strip> strips = {
-  //   {"anode",  22.5, 22.5},
-  //   {"cathode", 77.5, 22.5},
+  // const std::vector<ReadoutStrip> strips = {
+  //   {"strip0",  50., 20.},
+  //   {"strip1", 245., 25.},
+  //   {"strip2", 450., 20.},
   // };
+  const std::vector<ReadoutStrip> strips = {
+    {"anode",  22.5, 22.5},
+    {"cathode", 77.5, 22.5},
+  };
   if (!StripsInsideMap(strips, bx0, bx1)) return 1;
 
   ComponentAnalyticField wcmp;
@@ -241,18 +398,31 @@ int main() {
   PrintWeightingSanity(wcmp, strips, yTop, yBot);
 
   Sensor sensor;
-  sensor.AddComponent(&cmp);
-  for (const auto& s : strips) sensor.AddElectrode(&wcmp, s.label);
+  {
+    // Garfield prints electrode/time-window setup messages unconditionally
+    // to stdout. Silence only this setup block; stderr warnings remain live.
+    std::ofstream nullOut;
+    std::streambuf* oldCout = nullptr;
+    if (cfg.silenceGarfieldSensorSetup) {
+      nullOut.open("/dev/null");
+      if (nullOut) oldCout = std::cout.rdbuf(nullOut.rdbuf());
+    }
+    sensor.AddComponent(&cmp);
+    for (const auto& s : strips) sensor.AddElectrode(&wcmp, s.label);
+    sensor.SetTimeWindow(0., 0.005, 800);
+    sensor.SetArea(bx0, yTop + 0.02e-4, -5.e-4, bx1, yBot, 5.e-4);
+    if (oldCout) {
+      std::cout.flush();
+      std::cout.rdbuf(oldCout);
+    }
+  }
   std::cout << "Sensor has " << sensor.GetNumberOfElectrodes()
             << " electrodes (expect " << strips.size() << ")" << std::endl;
 
   if (cfg.doWeightingDump) {
     DumpWeightingField(wcmp, strips, bx0, bx1, yTop, yBot,
-                       cfg.outDir + "wfield_full.csv");
+                       cfg.outDir + "wfield_full.txt");
   }
-
-  sensor.SetTimeWindow(0., 0.005, 800);
-  sensor.SetArea(bx0, yTop + 0.02e-4, -5.e-4, bx1, yBot, 5.e-4);
 
   const double fineStepCm = cfg.fineStepNm * 1.e-7;   // nm -> cm
   const double bulkStepCm = cfg.bulkStepNm * 1.e-7;
@@ -273,11 +443,17 @@ int main() {
       ladderPrinted{0};
   AvalancheMC avalLadder;
   avalLadder.SetSensor(&sensor);
-  const std::size_t ladderCap = 5000;
+  const bool controlledFeedbackScan =
+      cfg.doFeedbackScan || cfg.doModelComparison;
+  const std::size_t ladderCap = controlledFeedbackScan
+      ? cfg.feedbackSizeCap : sizeCap;
+  const double ladderTimeWindowNs = controlledFeedbackScan
+      ? cfg.feedbackTimeWindowNs : cfg.driftWindowNs;
   ConfigureAvalanche(avalLadder, ladderStepCm, bulkStepCm, yFineLo, yFineHi,
-                     cfg.driftWindowNs, ladderCap, /*enableSignal=*/false,
-                     /*multithreading=*/true, "ladder", ladderCalls,
-                     ladderFine, ladderCoarse, ladderPrinted);
+                     ladderTimeWindowNs, ladderCap, /*enableSignal=*/false,
+                     /*multithreading=*/!controlledFeedbackScan,
+                     controlledFeedbackScan ? "feedback" : "ladder",
+                     ladderCalls, ladderFine, ladderCoarse, ladderPrinted);
 
   if (cfg.doConvergenceScan) {
     RunConvergenceScan(avalLadder, ladderStepCm, x0, yInj, ladderCap,
@@ -287,31 +463,68 @@ int main() {
               << ladderCoarse.load() << std::endl;
   }
 
-  if (cfg.doModelComparison) {
+  if (cfg.doFeedbackScan || cfg.doModelComparison) {
+    if (cfg.doModelComparison && !cfg.doFeedbackScan) {
+      std::cout << "NOTE: doModelComparison is a deprecated alias; "
+                   "running the explicit feedback scan.\n";
+    }
+
+    FeedbackScanConfig feedbackCfg;
+    feedbackCfg.models = cfg.feedbackModels.empty()
+        ? std::vector<std::string>{cfg.model} : cfg.feedbackModels;
+    feedbackCfg.minEvents = cfg.feedbackMinEvents;
+    feedbackCfg.maxEvents = cfg.feedbackMaxEvents;
+    feedbackCfg.batchSize = cfg.feedbackBatchSize;
+    feedbackCfg.targetRelativeSem = cfg.feedbackTargetRelativeSem;
+    feedbackCfg.heavyTailThresholdF =
+        cfg.feedbackHeavyTailThresholdF;
+    feedbackCfg.runHoleSeed = cfg.feedbackRunHoleSeed;
+    feedbackCfg.runPairSeed = cfg.feedbackRunPairSeed;
+
+    if (cfg.dumpTownsendTables) {
+      for (const auto& feedbackModel : feedbackCfg.models) {
+        if (!SetImpactIonisationModel(si, feedbackModel)) return 2;
+        DumpTownsendCoefficients(
+            si, cfg.outDir + "townsend_garfield_" + feedbackModel +
+                    "_" + std::to_string(static_cast<int>(
+                        std::lround(cfg.temperatureK))) + "K.csv");
+      }
+    }
+
     RunModelComparison(avalLadder, si, x0, yInj, ladderStepCm, ladderCap,
-                       cfg.outDir, biasLabel, eMax, globalMaxField);
-    std::cout << "[stepfn ladder] calls=" << ladderCalls.load()
+                       cfg.outDir, biasLabel, eMax, globalMaxField,
+                       feedbackCfg);
+    std::cout << "[stepfn feedback] calls=" << ladderCalls.load()
               << " fine=" << ladderFine.load() << " coarse="
               << ladderCoarse.load() << std::endl;
-    // restore the configured MIP model -- RunModelComparison leaves si
-    // set to whichever model it evaluated last
-    if (cfg.model == "massey") {
-      si.SetImpactIonisationModelMassey();
-    } else if (cfg.model == "grant") {
-      si.SetImpactIonisationModelGrant();
-    } else if (cfg.model == "okuto") {
-      si.SetImpactIonisationModelOkutoCrowell();
-    } else {
-      si.SetImpactIonisationModelVanOverstraetenDeMan();
-    }
+
+    // RunModelComparison leaves si set to the last scanned model.
+    if (!SetImpactIonisationModel(si, cfg.model)) return 2;
   }
 
   if (!cfg.doMIP) {
-    std::cout << "doMIP=false -- nothing more to compute." << std::endl;
+    std::cout << "doMIP=false -- diagnostics complete; skipping the MIP pass."
+              << std::endl;
     return 0;
   }
 
-  // MIP
+  // MIP ensemble
+  if (cfg.nMips <= 0) {
+    std::cerr << "nMips must be positive.\n";
+    return 2;
+  }
+  const bool runStatic = cfg.mipRunStatic;
+  const bool runScreened = cfg.mipRunScreened && cfg.spaceCharge;
+  if (cfg.mipRunScreened && !cfg.spaceCharge) {
+    std::cout << "NOTE: mipRunScreened=true but spaceCharge=false; "
+                 "screened mode is disabled.\n";
+  }
+  if (!runStatic && !runScreened) {
+    std::cerr << "No MIP mode selected. Enable mipRunStatic and/or "
+                 "mipRunScreened.\n";
+    return 2;
+  }
+
   SolidBox box(0.5 * (bx0 + bx1), 0.5 * (yTop + yBot), 0.,
                0.5 * (bx1 - bx0), 0.5 * d, 5.e-4);
   GeometrySimple geo;
@@ -326,28 +539,7 @@ int main() {
   track.SetSensor(&heedSensor);
   track.SetParticle("pi");
   track.SetMomentum(180.e9);
-  sensor.ClearSignal();
 
-  track.NewTrack(x0, yTop + 0.03e-4, 0., 0., 0., 1., 0.);
-  double xc, yc, zc, tc, ec, extra;
-  int nc = 0;
-  unsigned long nPrimary = 0; // total e-h pairs, all clusters
-  unsigned long ncl = 0;  // cluster count
-  unsigned long nTotal = 0; // electrons after multiplication (gain-ON loop)
-  double yLast = 0.;
-
-  std::vector<std::array<double, 4>> primaries;
-  while (track.GetCluster(xc, yc, zc, tc, nc, ec, extra)) {
-    ++ncl;
-    yLast = yc;
-    nPrimary += nc;
-    for (int k = 0; k < nc; ++k) primaries.push_back({xc, yc, zc, tc});
-  }
-  std::cout << "MIP track: " << ncl << " clusters, last at y = "
-            << yLast * 1.e4 << " um, " << nPrimary
-            << " primary e-h pairs" << std::endl;
-
-  // shared pass settings for both OFF and ON
   AvalanchePassConfig pc;
   pc.fineStepCm = fineStepCm;
   pc.bulkStepCm = bulkStepCm;
@@ -358,138 +550,751 @@ int main() {
   pc.xMin = bx0; pc.yMin = yTop + 0.02e-4; pc.zMin = -5.e-4;
   pc.xMax = bx1; pc.yMax = yBot;           pc.zMax = 5.e-4;
   pc.tStart = 0.; pc.tStep = 0.005; pc.nBins = 800;
+  pc.enableSignal = true;
+  pc.silenceGarfieldSetupStdout = cfg.silenceGarfieldSensorSetup;
 
-  std::vector<std::vector<double>> sigOff;
-  const auto tMipOffStart = Clock::now();
-  pc.multiplication = false;
-  RunAvalanchePass(cmp, wcmp, strips, primaries, pc, sigOff, nullptr, 500,
-                   "OFF");
-  std::cout << "[timer] MIP gain-OFF pass: " << ElapsedS(tMipOffStart)
-            << " s" << std::endl;
-  std::vector<double> qIntNoGain(strips.size(), 0.),
-      iMaxNoGain(strips.size(), 0.);
-  for (std::size_t k = 0; k < strips.size(); ++k) {
-    for (unsigned int i = 0; i < 800; ++i) {
-      const double s = sigOff[k][i];
-      qIntNoGain[k] += s;
-      if (std::abs(s) > std::abs(iMaxNoGain[k])) iMaxNoGain[k] = s;
-    }
-    std::cout << strips[k].label << " signal check (gain OFF): peak bin = "
-              << iMaxNoGain[k] << ", integral (arb.) = " << qIntNoGain[k]
-              << std::endl;
+  ComponentPoisson2d scField;
+  SpaceChargeConfig scCfg;
+  scCfg.enabled = runScreened;
+  scCfg.xMinCm = bx0; scCfg.xMaxCm = bx1;
+  scCfg.yMinCm = yTop; scCfg.yMaxCm = yBot;
+  scCfg.zMinCm = -5.e-4; scCfg.zMaxCm = 5.e-4;
+  scCfg.hMinCm = 0.02e-4;
+  scCfg.hMaxCm = 0.50e-4;
+  scCfg.zExtentCm = cfg.scZExtentUm * 1.e-4;
+  scCfg.tWindowNs = cfg.driftWindowNs;
+  scCfg.xProbeCm = x0;
+  scCfg.yProbeCm = yGain;
+  scCfg.maxIter = cfg.scMaxIter;
+  scCfg.relaxation = cfg.scRelaxation;
+  scCfg.mixNx = cfg.scMixNx;
+  scCfg.mixNy = cfg.scMixNy;
+  scCfg.deterministicIterations = cfg.scDeterministic;
+  scCfg.seedBase = cfg.scSeedBase;
+  scCfg.gainTol = cfg.scGainTol;
+  scCfg.fieldTol = cfg.scFieldTol;
+  scCfg.stableIterations = cfg.scStableIterations;
+  scCfg.fieldSampleNx = cfg.scFieldSampleNx;
+  scCfg.fieldSampleNy = cfg.scFieldSampleNy;
+  scCfg.fieldSampleXHalfWidthCm =
+      cfg.scFieldSampleXHalfWidthUm * 1.e-4;
+  scCfg.fieldSampleYHalfWidthCm =
+      cfg.scFieldSampleYHalfWidthUm * 1.e-4;
+  scCfg.verbose = cfg.scConsoleVerbosity >= 2;
+  if (scCfg.enabled && !SetupSpaceCharge(scField, scCfg, &si)) {
+    std::cerr << "space-charge setup failed; screened MIPs disabled.\n";
+    scCfg.enabled = false;
+  }
+  const bool actuallyRunScreened = runScreened && scCfg.enabled;
+  if (!runStatic && !actuallyRunScreened) return 2;
+
+  const std::string mipSuffix = biasLabel == "NA" ? "" : "_" + biasLabel + "V";
+  const std::string eventsPath = cfg.outDir + "mip_events" + mipSuffix + ".csv";
+  const std::string pairedPath = cfg.outDir + "mip_paired" + mipSuffix + ".csv";
+  const std::string primariesPath = cfg.outDir + "mip_primaries" + mipSuffix + ".csv";
+  const std::string samplesPath = cfg.outDir + "mip_final_samples" + mipSuffix + ".csv";
+  const std::string sampleSummaryPath =
+      cfg.outDir + "mip_final_sample_summary" + mipSuffix + ".csv";
+
+  std::ofstream fPrimaries;
+  if (cfg.mipWritePrimaries) {
+    fPrimaries.open(primariesPath);
+    fPrimaries << "event,pair,x_cm,y_cm,z_cm,t_ns\n";
   }
 
-  std::ofstream fpairs(cfg.outDir + (biasLabel == "NA" ? "mip_pairs.csv"
-      : ("mip_pairs_" + biasLabel + "V.csv")));
-  fpairs << "x_um,y_um,ne\n";
-  std::vector<std::vector<double>> sigOn;
-  const auto tMipOnStart = Clock::now();
-  pc.multiplication = true;
-  nTotal = RunAvalanchePass(cmp, wcmp, strips, primaries, pc, sigOn,
-                            &fpairs, 200, "ON");
-  fpairs.close();
-  const double countingGain = double(nTotal) / double(nPrimary);
-  std::cout << "MIP: " << nTotal << " electrons after multiplication -> "
-            << "counting gain " << countingGain << std::endl;
-  std::cout << "[timer] MIP gain-ON pass: " << ElapsedS(tMipOnStart)
-            << " s (" << primaries.size() << " primaries)" << std::endl;
+  std::ofstream fEvents(eventsPath);
+  fEvents << "event,bias,model,mode,nClusters,nPrimary,nTotal,countingGain,"
+             "chargeGain,peakOn,peakOff,intOn,intOff,scZExtentUm,"
+             "scIterations,scConverged,scCharge_e_per_cm,scField_Vcm,"
+             "elapsed_s";
+  for (const auto& strip : strips) {
+    fEvents << "," << strip.label << "_qOn_arb," << strip.label
+            << "_qOff_arb," << strip.label << "_fractionOn";
+  }
+  fEvents << "\n";
 
-  std::vector<double> qInt(strips.size(), 0.), iMax(strips.size(), 0.);
-  for (std::size_t k = 0; k < strips.size(); ++k) {
-    for (unsigned int i = 0; i < 800; ++i) {
-      const double s = sigOn[k][i];
-      qInt[k] += s;
-      if (std::abs(s) > std::abs(iMax[k])) iMax[k] = s;
-    }
-    const double stripGain = std::abs(qIntNoGain[k]) > 0.
-        ? qInt[k] / qIntNoGain[k] : 0.;
-    std::cout << strips[k].label << " signal check (gain ON): peak bin = "
-              << iMax[k] << ", integral (arb.) = " << qInt[k]
-              << ", charge-based gain = " << stripGain << std::endl;
+  std::ofstream fPaired;
+  if (runStatic && actuallyRunScreened) {
+    fPaired.open(pairedPath);
+    fPaired << "event,bias,model,nClusters,nPrimary,staticCountingGain,"
+               "screenedCountingGain,countingRatio,staticChargeGain,"
+               "screenedChargeGain,chargeRatio,scIterations,scConverged,"
+               "scCharge_e_per_cm,scField_Vcm\n";
+  }
+
+  std::ofstream fSamples;
+  std::ofstream fSampleSummary;
+  if (cfg.mipFinalSampleCount > 0) {
+    fSamples.open(samplesPath);
+    fSamples << "event,bias,model,mode,sample,seed,nClusters,nPrimary,"
+                "nTotal,countingGain,signalEnabled,chargeGainVsCanonicalOff,"
+                "scField_Vcm,elapsed_s\n";
+    fSampleSummary.open(sampleSummaryPath);
+    fSampleSummary << "event,bias,model,mode,nSamples,nPrimary,"
+                      "meanCountingGain,sdCountingGain,semCountingGain,"
+                      "meanChargeGainVsCanonicalOff,sdChargeGainVsCanonicalOff,"
+                      "semChargeGainVsCanonicalOff,scField_Vcm\n";
+  }
+
+  /* One row per event per iteration: lets the contraction ratio, Aitken
+     extrapolation and relaxation choice be evaluated per event instead
+     of inferred from a console log. */
+  std::ofstream iterCsv;
+  if (actuallyRunScreened && cfg.scWriteIterationHistory) {
+    iterCsv.open(cfg.outDir + "mip_spacecharge_iterations" + mipSuffix
+                 + ".csv");
+    iterCsv << "event,iteration,seed,relaxation,nPrimary,nTotal,gain,"
+               "inputProbeField_Vcm,outputProbeField_Vcm,"
+               "freshSignedCharge_e_per_cm,freshAbsCharge_e_per_cm,"
+               "mixedSignedCharge_e_per_cm,mixedAbsCharge_e_per_cm,"
+               "fieldRelL2,fieldRelMax,fieldSamples,relGainChange,"
+               "stableCount,converged\n";
   }
 
   {
-    double qTotalOn = 0.;
-    for (const auto& q : qInt) qTotalOn += std::abs(q);
-    std::cout << "charge sharing @ x0=" << x0 * 1.e4 << " um: ";
+    std::ofstream meta(cfg.outDir + "mip_run_config" + mipSuffix + ".txt");
+    meta << "bias=" << biasLabel << "\nmodel=" << cfg.model
+         << "\nnMips=" << cfg.nMips
+         << "\neventOffset=" << cfg.mipEventOffset
+         << "\nrunStatic=" << (runStatic ? 1 : 0)
+         << "\nrunScreened=" << (actuallyRunScreened ? 1 : 0)
+         << "\nspaceChargeMaster=" << (cfg.spaceCharge ? 1 : 0)
+         << "\nscZExtentUm=" << cfg.scZExtentUm
+         << "\nscMaxIter=" << cfg.scMaxIter
+         << "\nscRelaxation=" << cfg.scRelaxation
+         << "\nscDeterministic=" << (cfg.scDeterministic ? 1 : 0)
+         << "\nscSeedBase=" << cfg.scSeedBase
+         << "\nscDeterministicFinal="
+         << (cfg.scDeterministicFinal ? 1 : 0)
+         << "\nscConsoleVerbosity=" << cfg.scConsoleVerbosity
+         << "\nscGainTol=" << cfg.scGainTol
+         << "\nscConvergenceCriterion=fieldRelL2"
+         << "\nscFieldTol=" << cfg.scFieldTol
+         << "\nscStableIterations=" << cfg.scStableIterations
+         << "\nscMixNx=" << cfg.scMixNx
+         << "\nscMixNy=" << cfg.scMixNy
+         << "\nscFieldSampleNx=" << cfg.scFieldSampleNx
+         << "\nscFieldSampleNy=" << cfg.scFieldSampleNy
+         << "\nscFieldSampleXHalfWidthUm="
+         << cfg.scFieldSampleXHalfWidthUm
+         << "\nscFieldSampleYHalfWidthUm="
+         << cfg.scFieldSampleYHalfWidthUm
+         << "\nscWriteFinalFieldProfile="
+         << (cfg.scWriteFinalFieldProfile ? 1 : 0)
+         << "\nscFinalFieldProfilePoints="
+         << cfg.scFinalFieldProfilePoints
+         << "\nscFinalEvaluationPass="
+         << (cfg.scFinalEvaluationPass ? 1 : 0)
+         << "\nmipDeterministicPrimaries="
+         << (cfg.mipDeterministicPrimaries ? 1 : 0)
+         << "\nmipPrimarySeedBase=" << cfg.mipPrimarySeedBase
+         << "\nrngSeedScope=threadLocal"
+         << "\nrngSeedLocation=insideRunAvalanchePassOpenMPRegion"
+         << "\nrngWorkerSeedOffset=omp_get_thread_num"
+         << "\nparallelBitReplayable=0"
+         << "\nmipDeterministicGainOff="
+         << (cfg.mipDeterministicGainOff ? 1 : 0)
+         << "\nmipGainOffSeedOffset=" << cfg.mipGainOffSeedOffset
+         << "\nmipDeterministicStatic="
+         << (cfg.mipDeterministicStatic ? 1 : 0)
+         << "\nmipStaticSeedOffset=" << cfg.mipStaticSeedOffset
+         << "\nscFinalSeedOffset=" << cfg.scFinalSeedOffset
+         << "\nscReplayDiagnostic="
+         << (cfg.scReplayDiagnostic ? 1 : 0)
+         << "\nscReplayDiagnosticOnly="
+         << (cfg.scReplayDiagnosticOnly ? 1 : 0)
+         << "\nmipFinalSampleCount=" << cfg.mipFinalSampleCount
+         << "\nmipFinalSampleEnableSignal="
+         << (cfg.mipFinalSampleEnableSignal ? 1 : 0)
+         << "\nmipStaticSampleSeedOffset="
+         << cfg.mipStaticSampleSeedOffset
+         << "\nmipScreenedSampleSeedOffset="
+         << cfg.mipScreenedSampleSeedOffset
+         << "\nmipFinalSampleEventStride="
+         << cfg.mipFinalSampleEventStride
+         << "\nmipWritePrimaries=" << (cfg.mipWritePrimaries ? 1 : 0)
+         << "\nmipWriteOverlaySignals="
+         << (cfg.mipWriteOverlaySignals ? 1 : 0)
+         << "\nfineStepNm=" << cfg.fineStepNm
+         << "\nbulkStepNm=" << cfg.bulkStepNm
+         << "\ndriftWindowNs=" << cfg.driftWindowNs << "\n";
+  }
+
+  // Wide overlay storage, matching the 1000MIPs.cpp layout:
+  // one column per MIP and one CSV per strip/pass.
+  std::vector<int> overlayEventIds;
+  std::vector<unsigned long> overlayPrimaryCounts;
+  std::vector<std::vector<std::vector<double>>> sigOffOverlay(strips.size());
+  std::vector<std::vector<std::vector<double>>> sigStaticOverlay(strips.size());
+  std::vector<std::vector<std::vector<double>>> sigScreenedOverlay(strips.size());
+
+  struct ModeResult {
+    bool ran = false;
+    unsigned long nTotal = 0;
+    double countingGain = 0.;
+    double chargeGain = 0.;
+    SignalMetrics metrics;
+    std::vector<std::vector<double>> signal;
+    int scIterations = 0;
+    bool scConverged = false;
+    ScreeningFieldSample scSample;
+    double elapsedS = 0.;
+  };
+
+  const auto writeModeRow = [&](const int eventId, const char* mode,
+                                const unsigned long nClusters,
+                                const unsigned long nPrimary,
+                                const SignalMetrics& offMetrics,
+                                const ModeResult& r) {
+    fEvents << eventId << "," << biasLabel << "," << cfg.model << ","
+            << mode << "," << nClusters << "," << nPrimary << ","
+            << r.nTotal << "," << r.countingGain << "," << r.chargeGain
+            << "," << r.metrics.peak[r.metrics.peakStrip] << ","
+            << offMetrics.peak[offMetrics.peakStrip] << ","
+            << r.metrics.totalIntegral << "," << offMetrics.totalIntegral
+            << "," << (std::string(mode) == "screened" ? cfg.scZExtentUm : 0.)
+            << "," << r.scIterations << "," << (r.scConverged ? 1 : 0)
+            << "," << r.scSample.depositedChargeEPerCm << ","
+            << r.scSample.magnitudeVcm << "," << r.elapsedS;
+    double qAbs = 0.;
+    for (const double q : r.metrics.integral) qAbs += std::abs(q);
     for (std::size_t k = 0; k < strips.size(); ++k) {
-      const double frac = qTotalOn > 0. ? std::abs(qInt[k]) / qTotalOn : 0.;
-      std::cout << strips[k].label << "=" << frac << " ";
+      const double frac = qAbs > 0. ? std::abs(r.metrics.integral[k]) / qAbs : 0.;
+      fEvents << "," << r.metrics.integral[k] << ","
+              << offMetrics.integral[k] << "," << frac;
     }
-    std::cout << std::endl;
+    fEvents << "\n";
+  };
 
-    std::ifstream fcstest(cfg.outDir + "charge_sharing.csv");
-    const bool csExists = fcstest.good();
-    fcstest.close();
-    std::ofstream fcs(cfg.outDir + "charge_sharing.csv", std::ios::app);
-    if (!csExists) {
-      fcs << "bias,model,x0_um";
-      for (const auto& s : strips) fcs << "," << s.label << "_frac";
-      for (const auto& s : strips) fcs << "," << s.label << "_qOn_arb";
-      for (const auto& s : strips) fcs << "," << s.label << "_qOff_arb";
-      fcs << "\n";
+  for (int iMip = 0; iMip < cfg.nMips; ++iMip) {
+    const int eventId = cfg.mipEventOffset + iMip;
+    const auto tEventStart = Clock::now();
+    if (cfg.mipDeterministicPrimaries) {
+      SeedGarfieldRandom(cfg.mipPrimarySeedBase + eventId);
     }
-    fcs << biasLabel << "," << cfg.model << "," << x0 * 1.e4;
-    for (std::size_t k = 0; k < strips.size(); ++k) {
-      const double frac = qTotalOn > 0. ? std::abs(qInt[k]) / qTotalOn : 0.;
-      fcs << "," << frac;
+    track.NewTrack(x0, yTop + 0.03e-4, 0., 0., 0., 1., 0.);
+    double xc = 0., yc = 0., zc = 0., tc = 0., ec = 0., extra = 0.;
+    int nc = 0;
+    unsigned long nPrimary = 0, nClusters = 0;
+    std::vector<std::array<double, 4>> primaries;
+    while (track.GetCluster(xc, yc, zc, tc, nc, ec, extra)) {
+      ++nClusters;
+      nPrimary += nc;
+      for (int k = 0; k < nc; ++k) primaries.push_back({xc, yc, zc, tc});
     }
-    for (std::size_t k = 0; k < strips.size(); ++k) fcs << "," << qInt[k];
-    for (std::size_t k = 0; k < strips.size(); ++k)
-      fcs << "," << qIntNoGain[k];
-    fcs << "\n";
-    std::cout << "appended charge-sharing row to charge_sharing.csv"
-              << std::endl;
-  }
-
-  double qIntSumOn = 0., qIntSumOff = 0.;
-  for (std::size_t k = 0; k < strips.size(); ++k) {
-    qIntSumOn += qInt[k];
-    qIntSumOff += qIntNoGain[k];
-  }
-  const double chargeGain = std::abs(qIntSumOff) > 0.
-      ? qIntSumOn / qIntSumOff : 0.;
-  std::cout << "device charge-based gain (sum over all strips, ON/OFF) = "
-            << chargeGain << std::endl;
-  std::size_t kPeak = 0;
-  for (std::size_t k = 1; k < strips.size(); ++k) {
-    if (std::abs(iMax[k]) > std::abs(iMax[kPeak])) kPeak = k;
-  }
-
-  {
-    std::ofstream fsig(cfg.outDir + (biasLabel == "NA" ? "signal_pad.csv"
-        : ("signal_" + biasLabel + "V.csv")));
-    fsig << "bin,t_ns";
-    for (const auto& s : strips) fsig << "," << s.label << "_ON," << s.label
-                                       << "_OFF";
-    fsig << "\n";
-    for (unsigned int i = 0; i < 800; ++i) {
-      fsig << i << "," << (i + 0.5) * 0.005;
-      for (std::size_t k = 0; k < strips.size(); ++k) {
-        fsig << "," << sigOn[k][i] << "," << sigOff[k][i];
+    if (cfg.mipWritePrimaries) {
+      for (std::size_t ip = 0; ip < primaries.size(); ++ip) {
+        const auto& p = primaries[ip];
+        fPrimaries << eventId << "," << ip << "," << p[0] << ","
+                   << p[1] << "," << p[2] << "," << p[3] << "\n";
       }
-      fsig << "\n";
+    }
+    if (nPrimary == 0) {
+      std::cerr << "MIP event " << eventId << " produced no primary pairs; "
+                   "skipping.\n";
+      continue;
+    }
+
+    std::cout << "\n[MIP " << eventId << "] " << nClusters << " clusters, "
+              << nPrimary << " primary pairs\n";
+
+    const unsigned long eventSeedKey =
+        static_cast<unsigned long>(std::max(0, eventId));
+    const unsigned long gainOffSeed = cfg.scSeedBase +
+        cfg.mipGainOffSeedOffset + eventSeedKey;
+    AvalanchePassConfig pcOff = pc;
+    pcOff.multiplication = false;
+    pcOff.forceSerial = cfg.mipDeterministicGainOff;
+    pcOff.deterministicSeed = cfg.mipDeterministicGainOff;
+    pcOff.seed = gainOffSeed;
+    std::vector<std::vector<double>> sigOff;
+    RunAvalanchePass(cmp, wcmp, strips, primaries, pcOff, sigOff, nullptr,
+                     cfg.mipPairProgressEvery, "GAIN_OFF");
+    const SignalMetrics offMetrics = MeasureSignal(sigOff);
+    overlayEventIds.push_back(eventId);
+    overlayPrimaryCounts.push_back(nPrimary);
+    if (cfg.mipWriteOverlaySignals) {
+      for (std::size_t k = 0; k < strips.size(); ++k) {
+        sigOffOverlay[k].push_back(sigOff[k]);
+      }
+    }
+
+    std::vector<double> staticSampleCounting;
+    std::vector<double> staticSampleCharge;
+    std::vector<double> screenedSampleCounting;
+    std::vector<double> screenedSampleCharge;
+
+    const auto writeSampleSummary = [&](const char* mode,
+                                        const std::vector<double>& counting,
+                                        const std::vector<double>& charge,
+                                        const double scFieldVcm) {
+      if (!fSampleSummary.is_open() || counting.empty()) return;
+      const auto cs = ComputeSampleStats(counting);
+      const auto qs = ComputeSampleStats(charge);
+      fSampleSummary << eventId << "," << biasLabel << "," << cfg.model
+                     << "," << mode << "," << cs.n << "," << nPrimary
+                     << "," << cs.mean << "," << cs.sd << "," << cs.sem
+                     << "," << qs.mean << "," << qs.sd << "," << qs.sem
+                     << "," << scFieldVcm << "\n";
+      fSampleSummary.flush();
+    };
+
+    const auto runFrozenFieldSamples = [&](const char* mode,
+                                            Component* screeningField,
+                                            const unsigned long familyOffset,
+                                            std::vector<double>& counting,
+                                            std::vector<double>& charge,
+                                            const double scFieldVcm) {
+      if (cfg.mipFinalSampleCount <= 0) return;
+      AvalanchePassConfig pcSample = pc;
+      pcSample.multiplication = true;
+      pcSample.enableSignal = cfg.mipFinalSampleEnableSignal;
+      // Explicitly seeded samples are serial for bit-exact replay. Parallel
+      // workers can be independently seeded, but dynamic scheduling changes
+      // primary-to-stream assignment; use separate processes for throughput.
+      pcSample.forceSerial = true;
+      for (int is = 0; is < cfg.mipFinalSampleCount; ++is) {
+        const unsigned long seed = cfg.scSeedBase + familyOffset +
+            eventSeedKey * cfg.mipFinalSampleEventStride +
+            static_cast<unsigned long>(is);
+        pcSample.deterministicSeed = true;
+        pcSample.seed = seed;
+        std::vector<std::vector<double>> sampleSignal;
+        const auto ts = Clock::now();
+        const unsigned long nTotal = RunAvalanchePass(
+            cmp, wcmp, strips, primaries, pcSample, sampleSignal, nullptr,
+            0, std::string(mode) + "_SAMPLE", screeningField);
+        const double gCount = double(nTotal) / nPrimary;
+        double gCharge = std::numeric_limits<double>::quiet_NaN();
+        if (cfg.mipFinalSampleEnableSignal) {
+          const auto metrics = MeasureSignal(sampleSignal);
+          if (std::abs(offMetrics.totalIntegral) > 0.) {
+            gCharge = metrics.totalIntegral / offMetrics.totalIntegral;
+          }
+        }
+        counting.push_back(gCount);
+        if (std::isfinite(gCharge)) charge.push_back(gCharge);
+        if (fSamples.is_open()) {
+          fSamples << eventId << "," << biasLabel << "," << cfg.model
+                   << "," << mode << "," << is << "," << seed << ","
+                   << nClusters << "," << nPrimary << "," << nTotal << ","
+                   << gCount << ","
+                   << (cfg.mipFinalSampleEnableSignal ? 1 : 0) << ","
+                   << gCharge << "," << scFieldVcm << ","
+                   << ElapsedS(ts) << "\n";
+          fSamples.flush();
+        }
+      }
+      writeSampleSummary(mode, counting, charge, scFieldVcm);
+    };
+
+    ModeResult staticResult;
+    if (runStatic) {
+      const auto t0 = Clock::now();
+      staticResult.ran = true;
+      const unsigned long staticSeed = cfg.scSeedBase +
+          cfg.mipStaticSeedOffset + eventSeedKey;
+      AvalanchePassConfig pcStatic = pc;
+      pcStatic.multiplication = true;
+      pcStatic.forceSerial = cfg.mipDeterministicStatic;
+      pcStatic.deterministicSeed = cfg.mipDeterministicStatic;
+      pcStatic.seed = staticSeed;
+      std::ofstream pairs;
+      std::ofstream* pairPtr = nullptr;
+      if (cfg.mipWritePairFiles) {
+        const std::string path = cfg.outDir + "mip_pairs" + mipSuffix + "_"
+            + EventTag(eventId) + "_static.csv";
+        pairs.open(path);
+        pairs << "x_um,y_um,ne\n";
+        pairPtr = &pairs;
+      }
+      staticResult.nTotal = RunAvalanchePass(
+          cmp, wcmp, strips, primaries, pcStatic, staticResult.signal, pairPtr,
+          cfg.mipPairProgressEvery, "STATIC");
+      staticResult.metrics = MeasureSignal(staticResult.signal);
+      staticResult.countingGain = double(staticResult.nTotal) / nPrimary;
+      staticResult.chargeGain = std::abs(offMetrics.totalIntegral) > 0.
+          ? staticResult.metrics.totalIntegral / offMetrics.totalIntegral : 0.;
+      staticResult.elapsedS = ElapsedS(t0);
+      if (cfg.mipWriteOverlaySignals) {
+        for (std::size_t k = 0; k < strips.size(); ++k) {
+          sigStaticOverlay[k].push_back(staticResult.signal[k]);
+        }
+      }
+      writeModeRow(eventId, "static", nClusters, nPrimary, offMetrics,
+                   staticResult);
+      std::cout << "  static: Gcount=" << staticResult.countingGain
+                << " Gcharge=" << staticResult.chargeGain
+                << " seed=" << staticSeed << " serial="
+                << (pcStatic.forceSerial ? 1 : 0) << "\n";
+      runFrozenFieldSamples("static", nullptr,
+                            cfg.mipStaticSampleSeedOffset,
+                            staticSampleCounting, staticSampleCharge, 0.);
+    }
+
+    ModeResult screenedResult;
+    if (actuallyRunScreened) {
+      const auto t0 = Clock::now();
+      screenedResult.ran = true;
+
+      // Reset the perturbation before every new MIP. Without the zero-charge
+      // solve, the first iteration of event N would inherit event N-1's field.
+      scField.ClearCharge();
+      if (!scField.Solve()) {
+        std::cerr << "  [spacecharge] zero-field reset failed.\n";
+      }
+
+      double gainPrev = std::numeric_limits<double>::quiet_NaN();
+      ScreeningFieldGridSample fieldGridPrev;
+      bool haveFieldGridPrev = false;
+      int stableCount = 0;
+      std::vector<std::vector<double>> sigIter;
+      unsigned long nIterTotal = 0;
+
+      /* Spatial mixing grid. The blend must be on the charge DENSITY:
+         the cloud's shape changes between iterations, so rescaling a
+         scalar amplitude is not equivalent. Poisson is linear, so
+         blending rho is exactly blending the fields. */
+      ChargeGrid mixed, fresh;
+      mixed.Init(scCfg);
+      fresh.Init(scCfg);
+
+      /* Deterministic iterations run SERIALLY. RunAvalanchePass installs the
+         seed on the thread-local Garfield RNG inside its OpenMP region.
+         Serial execution is still required for bit-exact primary ordering. */
+      AvalanchePassConfig pcIter = pc;
+      pcIter.forceSerial = cfg.scDeterministic;
+      pcIter.deterministicSeed = cfg.scDeterministic;
+      pcIter.seed = cfg.scSeedBase + eventId;
+      // Intermediate signals are discarded. Disabling them avoids the
+      // weighting-field work and signal-bin accumulation on every iteration.
+      pcIter.enableSignal = false;
+
+      // TEMPORARY RNG DIAGNOSTIC: replay the same zero-SC avalanche
+      // twice in three transport modes. Exact A/B agreement is required in
+      // every mode for a fixed seed and byte-identical primary vector.
+      if (cfg.scReplayDiagnostic && eventId == cfg.mipEventOffset) {
+        struct ReplayResult {
+          unsigned long nTotal = 0;
+          double signedCharge = 0.;
+          double absoluteCharge = 0.;
+          ChargeGrid grid;
+        };
+
+        auto runOneReplay = [&](const AvalanchePassConfig& pcReplayBase,
+                                const std::string& tag,
+                                const unsigned long replaySeed) {
+          ReplayResult result;
+          result.grid.Init(scCfg);
+          result.grid.Clear();
+          std::vector<std::vector<double>> signal;
+          AvalanchePassConfig pcReplay = pcReplayBase;
+          pcReplay.deterministicSeed = true;
+          pcReplay.seed = replaySeed;
+          pcReplay.reportSeedThreads = true;
+
+          // The screening component is deliberately omitted here. Iteration 1
+          // has zero screening field, and this isolates AvalancheMC + TCAD.
+          result.nTotal = RunAvalanchePass(
+              cmp, wcmp, strips, primaries, pcReplay, signal, nullptr, 0,
+              tag, nullptr, nullptr, &scCfg, &result.grid);
+          result.signedCharge = result.grid.Total();
+          result.absoluteCharge = result.grid.AbsoluteTotal();
+          return result;
+        };
+
+        auto compareAndPrint = [&](const std::string& mode,
+                                   const AvalanchePassConfig& pcReplay) {
+          const unsigned long replaySeed = cfg.scSeedBase + eventId;
+          const auto a = runOneReplay(pcReplay, mode + "_A", replaySeed);
+          const auto b = runOneReplay(pcReplay, mode + "_B", replaySeed);
+
+          const bool rhoSizeMatch = a.grid.rho.size() == b.grid.rho.size();
+          std::size_t rhoMismatchCount = 0;
+          double rhoMaxAbsDiff = 0.;
+          if (rhoSizeMatch) {
+            for (std::size_t i = 0; i < a.grid.rho.size(); ++i) {
+              const double d = std::abs(a.grid.rho[i] - b.grid.rho[i]);
+              if (d != 0.) ++rhoMismatchCount;
+              rhoMaxAbsDiff = std::max(rhoMaxAbsDiff, d);
+            }
+          }
+          const bool rhoExactMatch = rhoSizeMatch && rhoMismatchCount == 0;
+
+          std::cout << std::setprecision(17)
+                    << "\n=== SERIAL AVALANCHE REPLAY TEST: " << mode
+                    << " ===\n"
+                    << "event=" << eventId
+                    << " seed=" << replaySeed
+                    << " nPrimary=" << nPrimary
+                    << " diffusion=" << (pcReplay.diffusion ? 1 : 0)
+                    << " multiplication=" << (pcReplay.multiplication ? 1 : 0)
+                    << "\n"
+                    << "A: nTotal=" << a.nTotal
+                    << " gain=" << static_cast<double>(a.nTotal) / nPrimary
+                    << " signedCharge=" << a.signedCharge
+                    << " absoluteCharge=" << a.absoluteCharge << "\n"
+                    << "B: nTotal=" << b.nTotal
+                    << " gain=" << static_cast<double>(b.nTotal) / nPrimary
+                    << " signedCharge=" << b.signedCharge
+                    << " absoluteCharge=" << b.absoluteCharge << "\n"
+                    << "nTotalMatch=" << (a.nTotal == b.nTotal ? 1 : 0)
+                    << " signedMatch="
+                    << (a.signedCharge == b.signedCharge ? 1 : 0)
+                    << " absoluteMatch="
+                    << (a.absoluteCharge == b.absoluteCharge ? 1 : 0)
+                    << " rhoExactMatch=" << (rhoExactMatch ? 1 : 0)
+                    << " rhoMismatchCount=" << rhoMismatchCount
+                    << " rhoMaxAbsDiff=" << rhoMaxAbsDiff
+                    << "\n===============================================\n";
+        };
+
+        AvalanchePassConfig pcFull = pcIter;
+        pcFull.diffusion = true;
+        pcFull.multiplication = true;
+        compareAndPrint("FULL", pcFull);
+
+        AvalanchePassConfig pcNoDiffusion = pcIter;
+        pcNoDiffusion.diffusion = false;
+        pcNoDiffusion.multiplication = true;
+        compareAndPrint("NO_DIFFUSION", pcNoDiffusion);
+
+        AvalanchePassConfig pcDriftOnly = pcIter;
+        pcDriftOnly.diffusion = false;
+        pcDriftOnly.multiplication = false;
+        compareAndPrint("NO_DIFFUSION_NO_MULTIPLICATION", pcDriftOnly);
+
+        // Restore the exact zero-SC starting condition before either exiting
+        // diagnostic mode or entering the normal iteration loop.
+        scField.ClearCharge();
+        if (!scField.Solve()) {
+          std::cerr << "Post-replay zero-field reset failed.\n";
+        }
+
+        if (cfg.scReplayDiagnosticOnly) {
+          std::cout << "Replay diagnostics complete; exiting before the normal "
+                       "space-charge iterations.\n";
+          return 0;
+        }
+      }
+
+      for (int it = 0; it < scCfg.maxIter; ++it) {
+        if (cfg.scConsoleVerbosity >= 2) {
+          std::cout << "  [spacecharge] iteration " << it + 1 << "/"
+                    << scCfg.maxIter << "\n";
+        }
+        const auto inputFieldSample = SampleScreeningField(scField, scCfg);
+        fresh.Clear();
+        nIterTotal = RunAvalanchePass(
+            cmp, wcmp, strips, primaries, pcIter, sigIter, nullptr,
+            cfg.mipPairProgressEvery, "SCREEN_ITER", &scField, nullptr,
+            &scCfg, &fresh);
+        ApplyRelaxedCharge(scField, mixed, fresh, scCfg.relaxation);
+        if (!scField.Solve()) {
+          std::cerr << "  [spacecharge] Solve() failed; stopping iterations.\n";
+          break;
+        }
+        screenedResult.scIterations = it + 1;
+        screenedResult.scSample = SampleScreeningField(scField, scCfg);
+        const auto fieldGrid = SampleScreeningFieldGrid(scField, scCfg);
+        const auto fieldChange = haveFieldGridPrev
+            ? CompareScreeningFieldGrids(fieldGridPrev, fieldGrid)
+            : ScreeningFieldChange{};
+        if (cfg.scConsoleVerbosity >= 2) {
+          ReportScreeningField(scField, scCfg);
+        }
+        const double gain = double(nIterTotal) / nPrimary;
+        const double fld = screenedResult.scSample.magnitudeVcm;
+        const double dG = std::isfinite(gainPrev)
+            ? std::abs(gain - gainPrev) /
+              std::max(1.e-12, std::abs(gainPrev))
+            : std::numeric_limits<double>::quiet_NaN();
+        const double dE = fieldChange.relativeL2;
+
+        // The screening field is the fixed-point state. Avalanche gain is
+        // branching-sensitive even for a reproducible stream, so dG remains
+        // a diagnostic but does not gate convergence.
+        const bool stableNow = std::isfinite(dE) && dE < scCfg.fieldTol;
+        stableCount = stableNow ? stableCount + 1 : 0;
+
+        if (cfg.scConsoleVerbosity >= 1) {
+          std::cout << "  [SC " << it + 1 << "/" << scCfg.maxIter
+                    << "] G=" << gain << " Esc=" << fld << " V/cm"
+                    << " dG=" << dG << " dE=" << dE
+                    << " stable=" << stableCount << "/"
+                    << scCfg.stableIterations << "\n";
+        }
+        const bool convergedNow =
+            stableCount >= std::max(1, scCfg.stableIterations);
+        if (iterCsv.is_open()) {
+          iterCsv << eventId << "," << it + 1 << ","
+                  << (cfg.scDeterministic ? cfg.scSeedBase + eventId : 0)
+                  << "," << scCfg.relaxation << "," << nPrimary << ","
+                  << nIterTotal << "," << gain << ","
+                  << inputFieldSample.magnitudeVcm << "," << fld << ","
+                  << fresh.Total() << "," << fresh.AbsoluteTotal() << ","
+                  << mixed.Total() << "," << mixed.AbsoluteTotal() << ","
+                  << fieldChange.relativeL2 << ","
+                  << fieldChange.relativeMax << ","
+                  << fieldChange.nCompared << "," << dG << ","
+                  << stableCount << "," << (convergedNow ? 1 : 0) << "\n";
+          iterCsv.flush();
+        }
+        if (convergedNow) {
+          screenedResult.scConverged = true;
+          break;
+        }
+        gainPrev = gain;
+        fieldGridPrev = fieldGrid;
+        haveFieldGridPrev = true;
+      }
+
+      std::ofstream pairs;
+      std::ofstream* pairPtr = nullptr;
+      if (cfg.mipWritePairFiles) {
+        const std::string path = cfg.outDir + "mip_pairs" + mipSuffix + "_"
+            + EventTag(eventId) + "_screened.csv";
+        pairs.open(path);
+        pairs << "x_um,y_um,ne\n";
+        pairPtr = &pairs;
+      }
+
+      // Intermediate iterations deliberately have signal calculation off,
+      // so a final evaluation pass is always required for the waveform and
+      // charge gain. The canonical pass uses its own seed family and is
+      // serial by default, separate from both the solver and static pass.
+      if (!cfg.scFinalEvaluationPass && cfg.scConsoleVerbosity >= 1) {
+        std::cout << "  [spacecharge] NOTE: forcing the final evaluation "
+                     "pass because iteration signals are disabled.\n";
+      }
+      const unsigned long screenedFinalSeed = cfg.scSeedBase +
+          cfg.scFinalSeedOffset + eventSeedKey;
+      AvalanchePassConfig pcFinal = pc;
+      pcFinal.multiplication = true;
+      pcFinal.enableSignal = true;
+      pcFinal.forceSerial = cfg.scDeterministicFinal;
+      pcFinal.deterministicSeed = cfg.scDeterministicFinal;
+      pcFinal.seed = screenedFinalSeed;
+      screenedResult.nTotal = RunAvalanchePass(
+          cmp, wcmp, strips, primaries, pcFinal, screenedResult.signal,
+          pairPtr, cfg.mipPairProgressEvery, "SCREEN_FINAL", &scField);
+      screenedResult.scSample = SampleScreeningField(scField, scCfg);
+      if (cfg.scWriteFinalFieldProfile) {
+        const std::string fieldPath = cfg.outDir + "spacecharge_field" +
+            mipSuffix + "_" + EventTag(eventId) + ".csv";
+        DumpCombinedFieldProfile(cmp, scField, x0, yTop, yBot,
+                                 cfg.scFinalFieldProfilePoints, fieldPath,
+                                 cfg.scConsoleVerbosity >= 1);
+      }
+      screenedResult.metrics = MeasureSignal(screenedResult.signal);
+      screenedResult.countingGain = double(screenedResult.nTotal) / nPrimary;
+      screenedResult.chargeGain = std::abs(offMetrics.totalIntegral) > 0.
+          ? screenedResult.metrics.totalIntegral / offMetrics.totalIntegral : 0.;
+      screenedResult.elapsedS = ElapsedS(t0);
+      if (cfg.mipWriteOverlaySignals) {
+        for (std::size_t k = 0; k < strips.size(); ++k) {
+          sigScreenedOverlay[k].push_back(screenedResult.signal[k]);
+        }
+      }
+      writeModeRow(eventId, "screened", nClusters, nPrimary, offMetrics,
+                   screenedResult);
+      std::cout << "  screened: Gcount=" << screenedResult.countingGain
+                << " Gcharge=" << screenedResult.chargeGain
+                << " field=" << screenedResult.scSample.magnitudeVcm
+                << " V/cm seed=" << screenedFinalSeed << " serial="
+                << (pcFinal.forceSerial ? 1 : 0) << "\n";
+      runFrozenFieldSamples("screened", &scField,
+                            cfg.mipScreenedSampleSeedOffset,
+                            screenedSampleCounting, screenedSampleCharge,
+                            screenedResult.scSample.magnitudeVcm);
+    }
+
+    if (staticResult.ran && screenedResult.ran) {
+      const double countRatio = staticResult.countingGain != 0.
+          ? screenedResult.countingGain / staticResult.countingGain : 0.;
+      const double chargeRatio = staticResult.chargeGain != 0.
+          ? screenedResult.chargeGain / staticResult.chargeGain : 0.;
+      fPaired << eventId << "," << biasLabel << "," << cfg.model << ","
+              << nClusters << "," << nPrimary << ","
+              << staticResult.countingGain << ","
+              << screenedResult.countingGain << "," << countRatio << ","
+              << staticResult.chargeGain << ","
+              << screenedResult.chargeGain << "," << chargeRatio << ","
+              << screenedResult.scIterations << ","
+              << (screenedResult.scConverged ? 1 : 0) << ","
+              << screenedResult.scSample.depositedChargeEPerCm << ","
+              << screenedResult.scSample.magnitudeVcm << "\n";
+    }
+
+    if (cfg.mipWritePerEventSignals) {
+      std::ofstream fs(cfg.outDir + "signal" + mipSuffix + "_"
+                       + EventTag(eventId) + ".csv");
+      fs << "bin,t_ns";
+      for (const auto& strip : strips) {
+        fs << "," << strip.label << "_GAIN_OFF";
+        if (staticResult.ran) fs << "," << strip.label << "_STATIC";
+        if (screenedResult.ran) fs << "," << strip.label << "_SCREENED";
+      }
+      fs << "\n";
+      for (unsigned int b = 0; b < pc.nBins; ++b) {
+        fs << b << "," << (b + 0.5) * pc.tStep;
+        for (std::size_t k = 0; k < strips.size(); ++k) {
+          fs << "," << sigOff[k][b];
+          if (staticResult.ran) fs << "," << staticResult.signal[k][b];
+          if (screenedResult.ran) fs << "," << screenedResult.signal[k][b];
+        }
+        fs << "\n";
+      }
+    }
+
+    if (cfg.mipProgressEvery > 0 &&
+        (iMip + 1) % cfg.mipProgressEvery == 0) {
+      std::cout << "[MIP ensemble] completed " << iMip + 1 << "/"
+                << cfg.nMips << " events in " << ElapsedS(tEventStart)
+                << " s for this event\n";
     }
   }
-  {
-    std::ifstream ftest(cfg.outDir + "mip_summary.csv");
-    const bool exists = ftest.good();
-    ftest.close();
-    std::ofstream fsum(cfg.outDir + "mip_summary.csv", std::ios::app);
-    if (!exists) {
-      fsum << "bias,model,nClusters,nPrimary,countingGain,chargeGain,"
-           << "peakOn,peakOff,intOn,intOff,elapsed_s\n";
-    }
-    fsum << biasLabel << "," << cfg.model << "," << ncl << "," << nPrimary
-         << "," << countingGain << "," << chargeGain << ","
-         << iMax[kPeak] << "," << iMaxNoGain[kPeak] << "," << qIntSumOn
-         << "," << qIntSumOff << "," << ElapsedS(tMipOnStart) << "\n";
-    std::cout << "appended MIP summary row (bias=" << biasLabel
-              << ", model=" << cfg.model << ", peak strip="
-              << strips[kPeak].label << ") to mip_summary.csv" << std::endl;
+
+  if (cfg.mipWriteOverlaySignals && !overlayEventIds.empty()) {
+    const auto writeOverlay = [&](const std::string& mode,
+                                  const std::vector<std::vector<std::vector<double>>>& data) {
+      for (std::size_t k = 0; k < strips.size(); ++k) {
+        if (data[k].size() != overlayEventIds.size()) {
+          std::cerr << "overlay " << mode << "/" << strips[k].label
+                    << " has " << data[k].size() << " signals for "
+                    << overlayEventIds.size() << " events; skipping file.\n";
+          continue;
+        }
+        const std::string path = cfg.outDir + "signal_overlay_" + mode + "_"
+            + strips[k].label + mipSuffix + ".csv";
+        std::ofstream out(path);
+        out << "time_ns";
+        for (const int eventId : overlayEventIds) out << ",trk" << eventId;
+        out << "\n";
+        out << "nPairs";
+        for (const auto nPrimary : overlayPrimaryCounts) out << "," << nPrimary;
+        out << "\n";
+        for (unsigned int b = 0; b < pc.nBins; ++b) {
+          out << (b + 0.5) * pc.tStep;
+          for (std::size_t i = 0; i < overlayEventIds.size(); ++i) {
+            out << "," << data[k][i][b];
+          }
+          out << "\n";
+        }
+        std::cout << "wrote " << path << "\n";
+      }
+    };
+
+    writeOverlay("gainOff", sigOffOverlay);
+    if (runStatic) writeOverlay("static", sigStaticOverlay);
+    if (actuallyRunScreened) writeOverlay("screened", sigScreenedOverlay);
   }
+
+  std::cout << "wrote " << eventsPath << "\n";
+  if (cfg.mipWritePrimaries) std::cout << "wrote " << primariesPath << "\n";
+  if (runStatic && actuallyRunScreened) std::cout << "wrote " << pairedPath << "\n";
   std::cout << "[timer] total run so far: " << ElapsedS(tRunStart)
-            << " s" << std::endl;
+            << " s\n";
 
   std::cout << "[timer] TOTAL RUNTIME: " << ElapsedS(tRunStart)
             << " s" << std::endl;

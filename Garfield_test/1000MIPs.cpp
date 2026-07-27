@@ -74,7 +74,8 @@ int main(int argc, char* argv[]) {
   //   {"strip1", 245., 25.},
   //   {"strip2", 450., 20.},
   // };
-  const std::vector<Strip> strips = {
+  
+  const std::vector<ReadoutStrip> strips = {
     {"anode",  22.5, 22.5},
     {"cathode", 77.5, 22.5},
   };

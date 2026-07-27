@@ -28,38 +28,6 @@ void PrintUsage(const char* exe) {
          " 180 80 output_feedback_180V/ okuto 500 5000 0.05 50 5000\n";
 }
 
-void DumpTownsendCoefficients(MediumSilicon& si,
-                              const std::string& path) {
-  std::ofstream out(path);
-  out << "E_Vcm,alpha_e_cm-1,alpha_h_cm-1,ok_e,ok_h\n";
-  for (double e = 1.e5; e <= 4.5e5 + 1.; e += 2.5e4) {
-    double alphaE = 0.;
-    double alphaH = 0.;
-    const bool okE = si.ElectronTownsend(0., e, 0., 0., 0., 0., alphaE);
-    const bool okH = si.HoleTownsend(0., e, 0., 0., 0., 0., alphaH);
-    out << e << "," << alphaE << "," << alphaH << ","
-        << (okE ? 1 : 0) << "," << (okH ? 1 : 0) << "\n";
-  }
-  std::cout << "wrote Garfield Townsend table to " << path << "\n";
-}
-
-bool SetImpactModel(MediumSilicon& si, const std::string& model) {
-  if (model == "okuto") {
-    si.SetImpactIonisationModelOkutoCrowell();
-  } else if (model == "massey") {
-    si.SetImpactIonisationModelMassey();
-  } else if (model == "grant") {
-    si.SetImpactIonisationModelGrant();
-  } else if (model == "vodm") {
-    si.SetImpactIonisationModelVanOverstraetenDeMan();
-  } else {
-    std::cerr << "Unknown model '" << model
-              << "'. Use okuto, massey, grant, or vodm.\n";
-    return false;
-  }
-  return true;
-}
-
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -96,10 +64,13 @@ int main(int argc, char* argv[]) {
 
   MediumSilicon si;
   si.SetTemperature(293.15);
-  if (!SetImpactModel(si, model)) return 2;
+  if (!SetImpactIonisationModel(si, model)) return 2;
   DumpTownsendCoefficients(
       si, outDir + "townsend_garfield_" + model + "_293K.csv");
 
+  // The uploaded structures use Silvaco region 1 as the silicon body,
+  // corresponding to Garfield region index 0. Oxide and metal regions must
+  // not be assigned a drift medium.
   if (cmp.GetNumberOfRegions() == 0) {
     std::cerr << "Field map contains no regions.\n";
     return 1;

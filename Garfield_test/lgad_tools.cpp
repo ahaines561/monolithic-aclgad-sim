@@ -1,6 +1,8 @@
 #include "lgad_tools.hh"
 
 #include "Garfield/Sensor.hh"
+#include "Garfield/Random.hh"
+#include "Garfield/RandomEngineRoot.hh"
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +14,10 @@
 #include <limits>
 #include <regex>
 #include <sstream>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 using namespace Garfield;
 
@@ -42,6 +48,56 @@ std::string FormatBias(double v) {
   return oss.str();
 }
 
+bool SetImpactIonisationModel(MediumSilicon& si,
+                              const std::string& model) {
+  if (model == "okuto") {
+    si.SetImpactIonisationModelOkutoCrowell();
+  } else if (model == "massey") {
+    si.SetImpactIonisationModelMassey();
+  } else if (model == "grant") {
+    si.SetImpactIonisationModelGrant();
+  } else if (model == "vodm") {
+    si.SetImpactIonisationModelVanOverstraetenDeMan();
+  } else {
+    std::cerr << "Unknown impact-ionisation model '" << model
+              << "'. Use okuto, massey, grant, or vodm.\n";
+    return false;
+  }
+  return true;
+}
+
+void DumpTownsendCoefficients(MediumSilicon& si,
+                              const std::string& csvPath,
+                              const double eMinVcm,
+                              const double eMaxVcm,
+                              const double eStepVcm) {
+  if (eStepVcm <= 0. || eMaxVcm < eMinVcm) {
+    std::cerr << "DumpTownsendCoefficients: invalid field range.\n";
+    return;
+  }
+
+  std::ofstream out(csvPath);
+  if (!out) {
+    std::cerr << "DumpTownsendCoefficients: could not open "
+              << csvPath << "\n";
+    return;
+  }
+
+  out << "E_Vcm,alpha_e_cm-1,alpha_h_cm-1,ok_e,ok_h\n";
+  for (double e = eMinVcm; e <= eMaxVcm + 0.5 * eStepVcm;
+       e += eStepVcm) {
+    double alphaE = 0.;
+    double alphaH = 0.;
+    const bool okE =
+        si.ElectronTownsend(0., e, 0., 0., 0., 0., alphaE);
+    const bool okH =
+        si.HoleTownsend(0., e, 0., 0., 0., 0., alphaH);
+    out << e << "," << alphaE << "," << alphaH << ","
+        << (okE ? 1 : 0) << "," << (okH ? 1 : 0) << "\n";
+  }
+  std::cout << "wrote Garfield Townsend table to " << csvPath << std::endl;
+}
+
 double MedianOf(std::vector<std::size_t> v) {
   if (v.empty()) return 0.;
   const std::size_t n = v.size();
@@ -53,7 +109,7 @@ double MedianOf(std::vector<std::size_t> v) {
   return 0.5 * (lo + hi);
 }
 
-bool StripsInsideMap(const std::vector<Strip>& strips, double bx0,
+bool StripsInsideMap(const std::vector<ReadoutStrip>& strips, double bx0,
                      double bx1) {
   bool ok = true;
   for (const auto& s : strips) {
@@ -192,7 +248,7 @@ FieldDumpResult DumpElectricField(Component& cmp, double x0, double x1,
 - per-strip Ew/wpot startup check (probed just inside the gap) 
 -plus an overlap sanity check under strip0. Pure diagnostic printing. */
 void PrintWeightingSanity(ComponentAnalyticField& wcmp,
-                          const std::vector<Strip>& strips, double yTop,
+                          const std::vector<ReadoutStrip>& strips, double yTop,
                           double yBot) {
   for (const auto& s : strips) {
     const double xc = s.centerUm * 1.e-4, yMid = 0.5 * (yTop + yBot);
@@ -257,7 +313,7 @@ void ConfigureAvalanche(AvalancheMC& av, double& stepCm, double bulkStepCm,
 // per-strip weighting potential over a grid, to a text file:
 // x_um,y_um,<label>_phi,...
 void DumpWeightingField(ComponentAnalyticField& wcmp,
-                        const std::vector<Strip>& strips, double bx0,
+                        const std::vector<ReadoutStrip>& strips, double bx0,
                         double bx1, double yTop, double yBot,
                         const std::string& outPath, int nx, int ny) {
   const auto tStart = Clock::now();
@@ -289,12 +345,15 @@ void DumpWeightingField(ComponentAnalyticField& wcmp,
 - without -fopenmp the pragmas are ignored and this runs serially */
 unsigned long RunAvalanchePass(
     Component& driftCmp, ComponentAnalyticField& wcmp,
-    const std::vector<Strip>& strips,
+    const std::vector<ReadoutStrip>& strips,
     const std::vector<std::array<double, 4>>& primaries,
     const AvalanchePassConfig& pc,
     std::vector<std::vector<double>>& signalOut,
     std::ofstream* pairsCsv, unsigned long printEvery,
-    const std::string& tag) {
+    const std::string& tag,
+    Component* scField, ComponentPoisson2d* scDeposit,
+    const SpaceChargeConfig* scCfg,
+    ChargeGrid* scGrid) {
   const std::size_t nStrips = strips.size();
   signalOut.assign(nStrips, std::vector<double>(pc.nBins, 0.));
   unsigned long nTotal = 0;
@@ -312,19 +371,75 @@ unsigned long RunAvalanchePass(
     oldCerr = std::cerr.rdbuf(devNull.rdbuf());
   }
 
-  #pragma omp parallel
+  // Garfield's TransportParticles progress meter is written to stdout.
+  // Redirect stdout for the full pass so deterministic serial iterations do
+  // not emit one progress line per primary. main.cpp prints event summaries
+  // only after this function returns, so those remain visible.
+  std::ofstream devNullPass;
+  std::streambuf* oldCoutPass = nullptr;
+  if (pc.silenceGarfieldAvalancheStdout) {
+    devNullPass.open("/dev/null");
+    if (devNullPass) oldCoutPass = std::cout.rdbuf(devNullPass.rdbuf());
+  }
+
+  // Optional narrower setup-only suppression when full-pass suppression is
+  // disabled.
+  std::ofstream devNullSetup;
+  std::streambuf* oldCout = nullptr;
+  if (!oldCoutPass && pc.silenceGarfieldSetupStdout) {
+    devNullSetup.open("/dev/null");
+    if (devNullSetup) oldCout = std::cout.rdbuf(devNullSetup.rdbuf());
+  }
+
+  // Record the actual OpenMP worker ids used for deterministic seeding.
+  // Printing is deferred until stdout/stderr have been restored.
+  std::vector<std::pair<int, unsigned long>> seededWorkers;
+
+  #pragma omp parallel if (!pc.forceSerial)
   {
+#if defined(_OPENMP)
+    const int workerId = omp_get_thread_num();
+#else
+    const int workerId = 0;
+#endif
+    if (pc.deterministicSeed) {
+      const unsigned long workerSeed =
+          pc.seed + static_cast<unsigned long>(workerId);
+      SeedGarfieldRandom(workerSeed);
+      if (pc.reportSeedThreads) {
+        #pragma omp critical
+        {
+          seededWorkers.emplace_back(workerId, workerSeed);
+        }
+      }
+    }
     // Sensor construction prints to stdout; serialise it so 8 threads'
     // messages don't interleave into garbage. Once per thread, so free.
     Sensor localSensor;
     #pragma omp critical
     {
       localSensor.AddComponent(&driftCmp);
-      for (const auto& s : strips) localSensor.AddElectrode(&wcmp, s.label);
-      localSensor.SetTimeWindow(pc.tStart, pc.tStep, pc.nBins);
+      // TCAD first: the sensor takes its medium from the first component
+      // returning status 0. The screening perturbation is added second.
+      if (scField) localSensor.AddComponent(scField);
+      if (pc.enableSignal) {
+        for (const auto& s : strips) localSensor.AddElectrode(&wcmp, s.label);
+        localSensor.SetTimeWindow(pc.tStart, pc.tStep, pc.nBins);
+      }
       localSensor.SetArea(pc.xMin, pc.yMin, pc.zMin,
                           pc.xMax, pc.yMax, pc.zMax);
     }
+
+    #pragma omp barrier
+    #pragma omp single
+    {
+      if (oldCout) {
+        std::cout.flush();
+        std::cout.rdbuf(oldCout);
+        oldCout = nullptr;
+      }
+    }
+    #pragma omp barrier
 
     double stepCm = pc.fineStepCm;
     // nPrinted seeded high so worker threads don't each dump 5 stepfn lines
@@ -333,18 +448,36 @@ unsigned long RunAvalanchePass(
     localAval.SetSensor(&localSensor);
     ConfigureAvalanche(localAval, stepCm, pc.bulkStepCm, pc.yFineLoCm,
                        pc.yFineHiCm, pc.timeWindowNs, pc.sizeCap,
-                       /*enableSignal=*/true, /*multithreading=*/false,
+                       pc.enableSignal, /*multithreading=*/false,
                        tag, nCalls, nFine, nCoarse, nPrinted);
+    localAval.EnableDiffusion(pc.diffusion);
     localAval.EnableMultiplication(pc.multiplication);
+    // drift paths are stored only when we need them to deposit space
+    // charge; they cost memory, so they stay off otherwise
+    if ((scDeposit || scGrid) && scCfg) localAval.EnableDriftLines(true);
 
     // per-thread CSV buffer: writing inside the loop would take a lock on
     // every single pair, serialising all threads
     std::ostringstream localRows;
 
+    /* Private grid per thread. ChargeGrid::Deposit writes to four nodes
+       and is NOT thread-safe, so a shared grid would race; the copies are
+       summed under one critical section at the end instead. */
+    ChargeGrid localGrid;
+    if (scGrid && scCfg) { localGrid = *scGrid; localGrid.Clear(); }
+
     #pragma omp for schedule(dynamic, 16) reduction(+ : nTotal)
     for (long long i = 0; i < nPrim; ++i) {
       const auto& p = primaries[i];
       localAval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
+      // AddCharge is mutex-protected, so depositing from inside the
+      // parallel loop is safe. Solve() is left to the caller.
+      if (scDeposit && scCfg) {
+        DepositAvalancheCharge(localAval, *scDeposit, *scCfg);
+      }
+      if (scGrid && scCfg) {
+        DepositAvalancheIntoGrid(localAval, localGrid, *scCfg);
+      }
       std::size_t ne = 0, ni = 0;
       localAval.GetAvalancheSize(ne, ni);
       nTotal += ne;
@@ -370,14 +503,38 @@ unsigned long RunAvalanchePass(
     #pragma omp critical
     {
       if (pairsCsv) *pairsCsv << localRows.str();
-      for (std::size_t k = 0; k < nStrips; ++k) {
-        for (unsigned int b = 0; b < pc.nBins; ++b) {
-          signalOut[k][b] += localSensor.GetSignal(strips[k].label, b);
+      if (scGrid && scCfg) {
+        for (std::size_t i = 0; i < scGrid->rho.size(); ++i) {
+          scGrid->rho[i] += localGrid.rho[i];
+        }
+      }
+      if (pc.enableSignal) {
+        for (std::size_t k = 0; k < nStrips; ++k) {
+          for (unsigned int b = 0; b < pc.nBins; ++b) {
+            signalOut[k][b] += localSensor.GetSignal(strips[k].label, b);
+          }
         }
       }
     }
   }
+  if (oldCout) std::cout.rdbuf(oldCout);
+  if (oldCoutPass) {
+    std::cout.flush();
+    std::cout.rdbuf(oldCoutPass);
+  }
   if (oldCerr) std::cerr.rdbuf(oldCerr);
+  if (pc.reportSeedThreads) {
+    std::sort(seededWorkers.begin(), seededWorkers.end());
+    std::cout << "  [" << tag << "] RNG seeded inside avalanche region:";
+    if (seededWorkers.empty()) {
+      std::cout << " none";
+    } else {
+      for (const auto& [workerId, workerSeed] : seededWorkers) {
+        std::cout << " thread=" << workerId << " seed=" << workerSeed;
+      }
+    }
+    std::cout << " forceSerial=" << (pc.forceSerial ? 1 : 0) << "\n";
+  }
   return nTotal;
 }
 
@@ -772,4 +929,344 @@ void RunModelComparison(
   std::cout << "wrote " << detailPath << " and " << summaryPath << "\n";
   std::cout << "[timer] feedback comparison: " << ElapsedS(tCmpStart)
             << " s\n";
+}
+
+/* build the FEM region, grounded electrodes and mesh, then Initialise().
+   Doping is deliberately left unset so this component carries only the
+   deposited avalanche charge the TCAD map already holds the ionised
+   dopants, and setting doping here would double-count them. */
+bool SetupSpaceCharge(ComponentPoisson2d& sc, const SpaceChargeConfig& cfg,
+                      Medium* medium) {
+  if (cfg.xMaxCm <= cfg.xMinCm || cfg.yMaxCm <= cfg.yMinCm) {
+    std::cerr << "SetupSpaceCharge: degenerate region." << std::endl;
+    return false;
+  }
+  // rectangle: ComponentPoisson2d wants edges parallel to x or y,
+  // anything else is approximated by a staircase
+  const std::vector<double> xv = {cfg.xMinCm, cfg.xMaxCm,
+                                  cfg.xMaxCm, cfg.xMinCm};
+  const std::vector<double> yv = {cfg.yMinCm, cfg.yMinCm,
+                                  cfg.yMaxCm, cfg.yMaxCm};
+  if (!sc.AddRegion(xv, yv, medium, "bulk")) {
+    std::cerr << "SetupSpaceCharge: AddRegion failed (does the medium have "
+              << "a dielectric constant?)." << std::endl;
+    return false;
+  }
+  // grounded Dirichlet boundaries. The electrode potentials themselves
+  // live in the TCAD map; this component only carries the perturbation,
+  // so both planes sit at 0 V.
+  sc.AddElectrode(cfg.xMinCm, cfg.yMinCm, cfg.xMaxCm, cfg.yMinCm, 0., "top");
+  sc.AddElectrode(cfg.xMinCm, cfg.yMaxCm, cfg.xMaxCm, cfg.yMaxCm, 0., "back");
+  sc.SetRangeZ(cfg.zMinCm, cfg.zMaxCm);
+  sc.SetMeshGranularity(cfg.hMinCm, cfg.hMaxCm);
+
+  if (!sc.Initialise()) {
+    std::cerr << "SetupSpaceCharge: Initialise() failed." << std::endl;
+    return false;
+  }
+  // pre-solve the weighting potentials: the lazy path is mutex-guarded,
+  // so leaving it to first use inside a parallel region would serialise
+  // the threads on the first hit
+  sc.RequestWeightingPotential("top");
+  sc.RequestWeightingPotential("back");
+  if (cfg.verbose) {
+    std::cout << "  [spacecharge] Poisson mesh ready over x = ["
+              << cfg.xMinCm * 1.e4 << ", " << cfg.xMaxCm * 1.e4 << "] um, y = ["
+              << cfg.yMinCm * 1.e4 << ", " << cfg.yMaxCm * 1.e4 << "] um"
+              << std::endl;
+  }
+  return true;
+}
+
+/* deposit one avalanche's carriers, weighted by residence time.
+   AddCharge takes elementary charges per cm of depth, so the carrier
+   count is divided by the effective z-extent. Electrons negative, holes
+   positive: their spatial separation is what opposes the field. */
+std::size_t DepositAvalancheCharge(const AvalancheMC& aval,
+                                   ComponentPoisson2d& sc,
+                                   const SpaceChargeConfig& cfg) {
+  std::size_t nOutside = 0, nEmpty = 0;
+  if (cfg.tWindowNs <= 0. || cfg.zExtentCm <= 0.) {
+    std::cerr << "DepositAvalancheCharge: bad time window or z-extent."
+              << std::endl;
+    return 0;
+  }
+  const double norm = 1.0 / (cfg.zExtentCm * cfg.tWindowNs);
+
+  auto deposit = [&](const std::vector<AvalancheMC::EndPoint>& eps,
+                     const double sign) {
+    for (const auto& ep : eps) {
+      if (ep.path.size() < 2) { ++nEmpty; continue; }
+      const double w = static_cast<double>(ep.weight) * sign * norm;
+      for (std::size_t k = 0; k + 1 < ep.path.size(); ++k) {
+        const auto& p0 = ep.path[k];
+        const auto& p1 = ep.path[k + 1];
+        const double dt = p1.t - p0.t;   // ns spent in this segment
+        if (dt <= 0.) continue;
+        if (!sc.AddCharge(0.5 * (p0.x + p1.x), 0.5 * (p0.y + p1.y), w * dt)) {
+          ++nOutside;
+        }
+      }
+    }
+  };
+  deposit(aval.GetElectrons(), -1.);
+  deposit(aval.GetHoles(), +1.);
+
+  if (nEmpty > 0 && cfg.verbose) {
+    std::cerr << "  [spacecharge] WARNING: " << nEmpty << " carriers had no"
+              << " stored path -- set aval.EnableDriftLines(true)"
+              << std::endl;
+  }
+  return nOutside;
+}
+
+ScreeningFieldSample SampleScreeningField(
+    ComponentPoisson2d& sc, const SpaceChargeConfig& cfg) {
+  ScreeningFieldSample r;
+  double ez = 0.;
+  Medium* medium = nullptr;
+  sc.ElectricField(cfg.xProbeCm, cfg.yProbeCm, 0., r.exVcm, r.eyVcm, ez,
+                   r.potentialV, medium, r.status);
+  r.magnitudeVcm = std::sqrt(r.exVcm * r.exVcm + r.eyVcm * r.eyVcm);
+  r.depositedChargeEPerCm = sc.GetTotalDepositedCharge();
+  return r;
+}
+
+ScreeningFieldGridSample SampleScreeningFieldGrid(
+    ComponentPoisson2d& sc, const SpaceChargeConfig& cfg) {
+  ScreeningFieldGridSample out;
+  const int nx = std::max(1, cfg.fieldSampleNx);
+  const int ny = std::max(1, cfg.fieldSampleNy);
+  out.exVcm.reserve(static_cast<std::size_t>(nx) * ny);
+  out.eyVcm.reserve(static_cast<std::size_t>(nx) * ny);
+
+  const double xLo = std::max(cfg.xMinCm,
+      cfg.xProbeCm - std::abs(cfg.fieldSampleXHalfWidthCm));
+  const double xHi = std::min(cfg.xMaxCm,
+      cfg.xProbeCm + std::abs(cfg.fieldSampleXHalfWidthCm));
+  const double yLo = std::max(cfg.yMinCm,
+      cfg.yProbeCm - std::abs(cfg.fieldSampleYHalfWidthCm));
+  const double yHi = std::min(cfg.yMaxCm,
+      cfg.yProbeCm + std::abs(cfg.fieldSampleYHalfWidthCm));
+
+  double sum2 = 0.;
+  for (int ix = 0; ix < nx; ++ix) {
+    const double x = nx == 1 ? cfg.xProbeCm
+        : xLo + (xHi - xLo) * ix / (nx - 1);
+    for (int iy = 0; iy < ny; ++iy) {
+      const double y = ny == 1 ? cfg.yProbeCm
+          : yLo + (yHi - yLo) * iy / (ny - 1);
+      double ex = 0., ey = 0., ez = 0., v = 0.;
+      int status = 0;
+      Medium* medium = nullptr;
+      sc.ElectricField(x, y, 0., ex, ey, ez, v, medium, status);
+      if (status != 0 || !std::isfinite(ex) || !std::isfinite(ey)) {
+        out.exVcm.push_back(std::numeric_limits<double>::quiet_NaN());
+        out.eyVcm.push_back(std::numeric_limits<double>::quiet_NaN());
+        continue;
+      }
+      out.exVcm.push_back(ex);
+      out.eyVcm.push_back(ey);
+      ++out.nValid;
+      const double mag2 = ex * ex + ey * ey;
+      sum2 += mag2;
+      out.maxMagnitudeVcm =
+          std::max(out.maxMagnitudeVcm, std::sqrt(mag2));
+    }
+  }
+  out.l2NormVcm = std::sqrt(sum2);
+  return out;
+}
+
+ScreeningFieldChange CompareScreeningFieldGrids(
+    const ScreeningFieldGridSample& previous,
+    const ScreeningFieldGridSample& current) {
+  ScreeningFieldChange out;
+  if (previous.exVcm.size() != current.exVcm.size() ||
+      previous.eyVcm.size() != current.eyVcm.size()) {
+    return out;
+  }
+
+  double diff2 = 0., ref2 = 0.;
+  double maxDiff = 0., maxRef = 0.;
+  for (std::size_t i = 0; i < current.exVcm.size(); ++i) {
+    const double pex = previous.exVcm[i];
+    const double pey = previous.eyVcm[i];
+    const double cex = current.exVcm[i];
+    const double cey = current.eyVcm[i];
+    if (!std::isfinite(pex) || !std::isfinite(pey) ||
+        !std::isfinite(cex) || !std::isfinite(cey)) {
+      continue;
+    }
+    const double dex = cex - pex;
+    const double dey = cey - pey;
+    const double d2 = dex * dex + dey * dey;
+    const double r2 = pex * pex + pey * pey;
+    diff2 += d2;
+    ref2 += r2;
+    maxDiff = std::max(maxDiff, std::sqrt(d2));
+    maxRef = std::max(maxRef, std::sqrt(r2));
+    ++out.nCompared;
+  }
+  if (out.nCompared == 0) return out;
+  out.relativeL2 = std::sqrt(diff2) / std::max(1.e-12, std::sqrt(ref2));
+  out.relativeMax = maxDiff / std::max(1.e-12, maxRef);
+  return out;
+}
+
+/* screening-field diagnostic. A few thousand V/cm against a ~376 kV/cm
+   gain layer is the expected scale. */
+void ReportScreeningField(ComponentPoisson2d& sc,
+                          const SpaceChargeConfig& cfg) {
+  const auto r = SampleScreeningField(sc, cfg);
+  std::cout << "  [spacecharge] deposited "
+            << r.depositedChargeEPerCm << " e/cm; screening field at"
+            << " probe = " << r.magnitudeVcm << " V/cm"
+            << " (status " << r.status << ")" << std::endl;
+}
+
+/* ---- spatial charge mixing ------------------------------------------ */
+
+void ChargeGrid::Init(const SpaceChargeConfig& cfg) {
+  nx = std::max(2, cfg.mixNx);
+  ny = std::max(2, cfg.mixNy);
+  xMinCm = cfg.xMinCm; xMaxCm = cfg.xMaxCm;
+  yMinCm = cfg.yMinCm; yMaxCm = cfg.yMaxCm;
+  rho.assign(static_cast<std::size_t>(nx) * ny, 0.);
+}
+
+double ChargeGrid::NodeX(int ix) const {
+  return xMinCm + (xMaxCm - xMinCm) * ix / (nx - 1);
+}
+double ChargeGrid::NodeY(int iy) const {
+  return yMinCm + (yMaxCm - yMinCm) * iy / (ny - 1);
+}
+double ChargeGrid::Total() const {
+  double t = 0.;
+  for (double r : rho) t += r;
+  return t;
+}
+double ChargeGrid::AbsoluteTotal() const {
+  double t = 0.;
+  for (double r : rho) t += std::abs(r);
+  return t;
+}
+
+/* cloud-in-cell: split q among the four surrounding nodes by bilinear
+   weight. Conserves charge exactly and keeps sub-cell position, unlike
+   dumping the whole cell's charge at its centre. */
+void ChargeGrid::Deposit(const double xCm, const double yCm,
+                         const double q) {
+  if (nx < 2 || ny < 2) return;
+  const double dx = (xMaxCm - xMinCm) / (nx - 1);
+  const double dy = (yMaxCm - yMinCm) / (ny - 1);
+  if (dx <= 0. || dy <= 0.) return;
+  if (xCm < xMinCm || xCm > xMaxCm ||
+      yCm < yMinCm || yCm > yMaxCm) return;
+  const double gx = std::clamp((xCm - xMinCm) / dx, 0., double(nx - 1));
+  const double gy = std::clamp((yCm - yMinCm) / dy, 0., double(ny - 1));
+  const int ix = std::min(nx - 2, static_cast<int>(std::floor(gx)));
+  const int iy = std::min(ny - 2, static_cast<int>(std::floor(gy)));
+  const double fx = std::clamp(gx - ix, 0., 1.);
+  const double fy = std::clamp(gy - iy, 0., 1.);
+  const auto idx = [&](int a, int b) {
+    return static_cast<std::size_t>(b) * nx + a;
+  };
+  rho[idx(ix,     iy    )] += q * (1. - fx) * (1. - fy);
+  rho[idx(ix + 1, iy    )] += q * fx        * (1. - fy);
+  rho[idx(ix,     iy + 1)] += q * (1. - fx) * fy;
+  rho[idx(ix + 1, iy + 1)] += q * fx        * fy;
+}
+
+std::size_t DepositAvalancheIntoGrid(const AvalancheMC& aval,
+                                     ChargeGrid& grid,
+                                     const SpaceChargeConfig& cfg) {
+  std::size_t nOutside = 0, nEmpty = 0;
+  if (cfg.tWindowNs <= 0. || cfg.zExtentCm <= 0.) return 0;
+  const double norm = 1.0 / (cfg.zExtentCm * cfg.tWindowNs);
+
+  auto deposit = [&](const std::vector<AvalancheMC::EndPoint>& eps,
+                     const double sign) {
+    for (const auto& ep : eps) {
+      if (ep.path.size() < 2) { ++nEmpty; continue; }
+      const double w = static_cast<double>(ep.weight) * sign * norm;
+      for (std::size_t k = 0; k + 1 < ep.path.size(); ++k) {
+        const auto& p0 = ep.path[k];
+        const auto& p1 = ep.path[k + 1];
+        const double dt = p1.t - p0.t;
+        if (dt <= 0.) continue;
+        const double xm = 0.5 * (p0.x + p1.x);
+        const double ym = 0.5 * (p0.y + p1.y);
+        if (xm < grid.xMinCm || xm > grid.xMaxCm ||
+            ym < grid.yMinCm || ym > grid.yMaxCm) { ++nOutside; continue; }
+        grid.Deposit(xm, ym, w * dt);
+      }
+    }
+  };
+  deposit(aval.GetElectrons(), -1.);
+  deposit(aval.GetHoles(), +1.);
+  if (nEmpty > 0 && cfg.verbose) {
+    std::cerr << "  [spacecharge] WARNING: " << nEmpty << " carriers had no"
+              << " stored path -- set aval.EnableDriftLines(true)\n";
+  }
+  return nOutside;
+}
+
+void ApplyRelaxedCharge(ComponentPoisson2d& sc, ChargeGrid& mixed,
+                        const ChargeGrid& fresh, const double lambda) {
+  const double lam = std::min(1., std::max(0., lambda));
+  if (mixed.rho.size() != fresh.rho.size()) {
+    std::cerr << "ApplyRelaxedCharge: grid size mismatch.\n";
+    return;
+  }
+  // Poisson is linear, so blending the density is exactly equivalent to
+  // blending the resulting fields -- and unlike a scalar amplitude
+  // rescale it is valid even when the cloud changes shape.
+  for (std::size_t i = 0; i < mixed.rho.size(); ++i) {
+    mixed.rho[i] = (1. - lam) * mixed.rho[i] + lam * fresh.rho[i];
+  }
+  sc.ClearCharge();
+  std::size_t nAccepted = 0, nRejected = 0;
+  const double dx = mixed.nx > 1
+      ? (mixed.xMaxCm - mixed.xMinCm) / (mixed.nx - 1) : 0.;
+  const double dy = mixed.ny > 1
+      ? (mixed.yMaxCm - mixed.yMinCm) / (mixed.ny - 1) : 0.;
+  // Exact boundary coordinates may not belong to a FEM element under
+  // strict lookup tests. Nudge boundary grid nodes a negligible distance
+  // inside while retaining their charge and relative position.
+  const double epsX = std::max(1.e-12, 1.e-6 * std::abs(dx));
+  const double epsY = std::max(1.e-12, 1.e-6 * std::abs(dy));
+  for (int iy = 0; iy < mixed.ny; ++iy) {
+    for (int ix = 0; ix < mixed.nx; ++ix) {
+      const double q = mixed.rho[static_cast<std::size_t>(iy) * mixed.nx + ix];
+      if (q == 0.) continue;
+      const double x = std::clamp(mixed.NodeX(ix),
+                                  mixed.xMinCm + epsX,
+                                  mixed.xMaxCm - epsX);
+      const double y = std::clamp(mixed.NodeY(iy),
+                                  mixed.yMinCm + epsY,
+                                  mixed.yMaxCm - epsY);
+      if (sc.AddCharge(x, y, q)) {
+        ++nAccepted;
+      } else {
+        ++nRejected;
+      }
+    }
+  }
+  if (nAccepted == 0) {
+    std::cerr << "  [spacecharge] WARNING: no charge accepted by the solver"
+              << " -- is the mixing grid inside the FEM region?\n";
+  } else if (nRejected > 0) {
+    std::cerr << "  [spacecharge] WARNING: " << nRejected
+              << " nonzero mixing-grid nodes were rejected by AddCharge.\n";
+  }
+}
+
+/* Re-seed Garfield's RNG for the calling thread. Both this persistent
+   engine and Garfield::Random::draw are thread_local, so parallel workers do
+   not race while installing independently offset streams. */
+void SeedGarfieldRandom(const unsigned long seed) {
+  static thread_local Garfield::RandomEngineRoot engine;
+  engine.SetSeed(static_cast<unsigned int>(seed));
+  Garfield::Random::SetEngine(engine);
 }
