@@ -2,7 +2,6 @@
 
 #include "Garfield/Sensor.hh"
 #include "Garfield/Random.hh"
-#include "Garfield/RandomEngineRoot.hh"
 
 #include <algorithm>
 #include <atomic>
@@ -344,7 +343,7 @@ void DumpWeightingField(ComponentAnalyticField& wcmp,
 - per-thread signals are summed at the end (induced signals are additive)
 - without -fopenmp the pragmas are ignored and this runs serially */
 unsigned long RunAvalanchePass(
-    Component& driftCmp, ComponentAnalyticField& wcmp,
+    Component& driftCmp, Component& weightingCmp,
     const std::vector<ReadoutStrip>& strips,
     const std::vector<std::array<double, 4>>& primaries,
     const AvalanchePassConfig& pc,
@@ -353,9 +352,17 @@ unsigned long RunAvalanchePass(
     const std::string& tag,
     Component* scField, ComponentPoisson2d* scDeposit,
     const SpaceChargeConfig* scCfg,
-    ChargeGrid* scGrid) {
+    ChargeGrid* scGrid,
+    std::vector<std::vector<double>>* promptSignalOut,
+    std::vector<std::vector<double>>* delayedSignalOut) {
   const std::size_t nStrips = strips.size();
   signalOut.assign(nStrips, std::vector<double>(pc.nBins, 0.));
+  if (promptSignalOut) {
+    promptSignalOut->assign(nStrips, std::vector<double>(pc.nBins, 0.));
+  }
+  if (delayedSignalOut) {
+    delayedSignalOut->assign(nStrips, std::vector<double>(pc.nBins, 0.));
+  }
   unsigned long nTotal = 0;
   std::atomic<unsigned long> nDone{0};  // incremented lock-free by all threads
   const auto tStart = Clock::now();
@@ -372,9 +379,8 @@ unsigned long RunAvalanchePass(
   }
 
   // Garfield's TransportParticles progress meter is written to stdout.
-  // Redirect stdout for the full pass so deterministic serial iterations do
-  // not emit one progress line per primary. main.cpp prints event summaries
-  // only after this function returns, so those remain visible.
+  // Redirect stdout for the full pass so large MIP ensembles do not emit one
+  // progress line per primary. main.cpp prints event summaries after return.
   std::ofstream devNullPass;
   std::streambuf* oldCoutPass = nullptr;
   if (pc.silenceGarfieldAvalancheStdout) {
@@ -391,28 +397,9 @@ unsigned long RunAvalanchePass(
     if (devNullSetup) oldCout = std::cout.rdbuf(devNullSetup.rdbuf());
   }
 
-  // Record the actual OpenMP worker ids used for deterministic seeding.
-  // Printing is deferred until stdout/stderr have been restored.
-  std::vector<std::pair<int, unsigned long>> seededWorkers;
 
   #pragma omp parallel if (!pc.forceSerial)
   {
-#if defined(_OPENMP)
-    const int workerId = omp_get_thread_num();
-#else
-    const int workerId = 0;
-#endif
-    if (pc.deterministicSeed) {
-      const unsigned long workerSeed =
-          pc.seed + static_cast<unsigned long>(workerId);
-      SeedGarfieldRandom(workerSeed);
-      if (pc.reportSeedThreads) {
-        #pragma omp critical
-        {
-          seededWorkers.emplace_back(workerId, workerSeed);
-        }
-      }
-    }
     // Sensor construction prints to stdout; serialise it so 8 threads'
     // messages don't interleave into garbage. Once per thread, so free.
     Sensor localSensor;
@@ -423,13 +410,27 @@ unsigned long RunAvalanchePass(
       // returning status 0. The screening perturbation is added second.
       if (scField) localSensor.AddComponent(scField);
       if (pc.enableSignal) {
-        for (const auto& s : strips) localSensor.AddElectrode(&wcmp, s.label);
+        for (const auto& s : strips) {
+          localSensor.AddElectrode(&weightingCmp, s.label);
+        }
         localSensor.SetTimeWindow(pc.tStart, pc.tStep, pc.nBins);
+        if (pc.enableDelayedSignal) {
+          localSensor.EnableDelayedSignal();
+          if (!pc.delayedSignalTimesNs.empty()) {
+            localSensor.SetDelayedSignalTimes(pc.delayedSignalTimesNs);
+          }
+          if (pc.delayedSignalAveragingOrder > 0) {
+            localSensor.SetDelayedSignalAveragingOrder(
+                pc.delayedSignalAveragingOrder);
+          }
+        }
       }
       localSensor.SetArea(pc.xMin, pc.yMin, pc.zMin,
                           pc.xMax, pc.yMax, pc.zMax);
     }
 
+    // No worker may start avalanche processing until all local Sensors have
+    // been built and stdout has been restored by one thread.
     #pragma omp barrier
     #pragma omp single
     {
@@ -512,6 +513,14 @@ unsigned long RunAvalanchePass(
         for (std::size_t k = 0; k < nStrips; ++k) {
           for (unsigned int b = 0; b < pc.nBins; ++b) {
             signalOut[k][b] += localSensor.GetSignal(strips[k].label, b);
+            if (promptSignalOut) {
+              (*promptSignalOut)[k][b] +=
+                  localSensor.GetPromptSignal(strips[k].label, b);
+            }
+            if (delayedSignalOut) {
+              (*delayedSignalOut)[k][b] +=
+                  localSensor.GetDelayedSignal(strips[k].label, b);
+            }
           }
         }
       }
@@ -523,18 +532,6 @@ unsigned long RunAvalanchePass(
     std::cout.rdbuf(oldCoutPass);
   }
   if (oldCerr) std::cerr.rdbuf(oldCerr);
-  if (pc.reportSeedThreads) {
-    std::sort(seededWorkers.begin(), seededWorkers.end());
-    std::cout << "  [" << tag << "] RNG seeded inside avalanche region:";
-    if (seededWorkers.empty()) {
-      std::cout << " none";
-    } else {
-      for (const auto& [workerId, workerSeed] : seededWorkers) {
-        std::cout << " thread=" << workerId << " seed=" << workerSeed;
-      }
-    }
-    std::cout << " forceSerial=" << (pc.forceSerial ? 1 : 0) << "\n";
-  }
   return nTotal;
 }
 
@@ -933,7 +930,7 @@ void RunModelComparison(
 
 /* build the FEM region, grounded electrodes and mesh, then Initialise().
    Doping is deliberately left unset so this component carries only the
-   deposited avalanche charge the TCAD map already holds the ionised
+   deposited avalanche charge -- the TCAD map already holds the ionised
    dopants, and setting doping here would double-count them. */
 bool SetupSpaceCharge(ComponentPoisson2d& sc, const SpaceChargeConfig& cfg,
                       Medium* medium) {
@@ -1262,11 +1259,3 @@ void ApplyRelaxedCharge(ComponentPoisson2d& sc, ChargeGrid& mixed,
   }
 }
 
-/* Re-seed Garfield's RNG for the calling thread. Both this persistent
-   engine and Garfield::Random::draw are thread_local, so parallel workers do
-   not race while installing independently offset streams. */
-void SeedGarfieldRandom(const unsigned long seed) {
-  static thread_local Garfield::RandomEngineRoot engine;
-  engine.SetSeed(static_cast<unsigned int>(seed));
-  Garfield::Random::SetEngine(engine);
-}

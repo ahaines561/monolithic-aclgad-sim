@@ -18,6 +18,23 @@
 
 using Clock = std::chrono::steady_clock;
 
+/* Silicon with a screening correction applied to impact ionisation only.
+
+Garfield has no space-charge feedback: the avalanche never perturbs the
+field it grows in. Silvaco's coupled Poisson solve does, and that is the
+whole measured Garfield/Silvaco gain gap -- a ~2.4% (150 V) to ~3.1%
+(180 V) effective deficit in the gain-layer field.
+
+This scales the field seen by the Townsend calculation ONLY. Drift
+velocity, diffusion and timing are untouched, which is deliberate: the
+gain-OFF passes of the two codes already agree, so drift is validated and
+must not be modified. AvalancheMC::GetTownsend falls through to the
+medium when no Townsend map is loaded, and LoadSilvaco imports only the
+potential and field, so this override is the multiplication path.
+
+Set the scale as f = 1 - kappa * G, with kappa calibrated once against a
+known Garfield/Silvaco pair (kappa = 0.00313 for lgad_deepjte, Okuto).
+f = 1 restores stock behaviour exactly. */
 class ScreenedSilicon : public Garfield::MediumSilicon {
  public:
   void SetFieldScale(const double f) { m_fscale = f; }
@@ -106,10 +123,10 @@ struct SpaceChargeConfig {
   int mixNx = 101, mixNy = 501;
 
   /* The screening field is the fixed-point state variable. Convergence is
-     therefore checked on the full sampled screening field in the gain-layer
+     checked on the full sampled screening field in the gain-layer
      neighbourhood. Gain remains an observable/diagnostic and is evaluated
-     on the converged field in the final deterministic pass. Requiring three
-     stable transitions avoids stopping on one accidental close pair. */
+     on the converged field in a final signal pass. Requiring three stable
+     transitions avoids stopping on one accidental close pair. */
   double fieldTol = 0.01;
   int stableIterations = 3;
   int fieldSampleNx = 11;
@@ -117,14 +134,8 @@ struct SpaceChargeConfig {
   double fieldSampleXHalfWidthCm = 5.e-4;  // 5 um
   double fieldSampleYHalfWidthCm = 1.e-4;  // 1 um
 
-  /* Deterministic iterations. Garfield::Random::draw is thread_local, so
-     the seed must be installed on the same OpenMP worker that executes
-     AvalancheMC. RunAvalanchePass does this inside its parallel region.
-     Bit-exact replay still requires serial execution: with dynamic OpenMP
-     scheduling, primary-to-thread assignment can change even when each
-     worker has a reproducible, independently offset seed. */
-  bool deterministicIterations = false;
-  unsigned long seedBase = 180000;
+  /* Gain remains a diagnostic only; stochastic avalanche fluctuations do
+     not gate field convergence. Relaxation provides noise suppression. */
   double gainTol = 0.01;     // diagnostic only; does not gate convergence
 
   // probe point for the screening-field diagnostic [cm]
@@ -187,21 +198,6 @@ std::size_t DepositAvalancheIntoGrid(const Garfield::AvalancheMC& aval,
    Does NOT call Solve(). */
 void ApplyRelaxedCharge(Garfield::ComponentPoisson2d& sc, ChargeGrid& mixed,
                         const ChargeGrid& fresh, double lambda);
-
-/* Re-seed the Garfield RNG for the calling thread. Random::draw is
-   thread_local in this Garfield++ build, so every worker that executes an
-   avalanche must call this helper itself. RunAvalanchePass handles that when
-   AvalanchePassConfig::deterministicSeed is enabled. The implementation uses
-   a thread_local persistent RandomEngineRoot and calls SetSeed after complete
-   construction, avoiding the seeded constructor's base/derived ordering bug.
-
-   Bit-exact replay requires forceSerial=true. In parallel mode, worker streams
-   are independently seeded but dynamic scheduling can change which primary
-   consumes which stream. Use SpaceChargeConfig::deterministicIterations for
-   the fixed-point passes and forceSerial for explicitly seeded canonical
-   regression passes. Use separate processes when parallel throughput and
-   independently replayable samples are both required. */
-void SeedGarfieldRandom(unsigned long seed);
 
 struct ScreeningFieldSample {
   double exVcm = 0.;
@@ -371,25 +367,20 @@ struct AvalanchePassConfig {
   // AddElectrode and SetTimeWindow write routine setup messages to stdout.
   // This narrower switch is used only when full-pass stdout silencing is off.
   bool silenceGarfieldSetupStdout = true;
-  /* Install an explicit Garfield RNG seed inside the OpenMP region, on each
-     worker's thread-local Random::draw instance. Worker i receives seed+i.
-     This makes worker streams controlled, but dynamic scheduling means a
-     parallel pass is statistically reproducible rather than bit-replayable. */
-  bool deterministicSeed = false;
-  unsigned long seed = 0;
-  // Print the worker ids and effective seeds after the pass. Diagnostic only.
-  bool reportSeedThreads = false;
+  // Include the delayed weighting-field contribution in the signal.
+  // The weighting component registered with Sensor::AddElectrode must provide
+  // DelayedWeightingPotential/Field for each requested electrode label.
+  bool enableDelayedSignal = false;
+  std::vector<double> delayedSignalTimesNs;
+  std::size_t delayedSignalAveragingOrder = 0;
 
-  /* Run the avalanche loop single-threaded. This is required for bit-exact
-     replay because schedule(dynamic, 16) does not pin primaries to workers.
-     Implemented with OpenMP's if() clause, so the region executes with one
-     thread and receives exactly `seed + 0`. */
+  // Optional serial execution for debugging or thread-safety studies.
   bool forceSerial = false;
 };
 
 unsigned long RunAvalanchePass(
     Garfield::Component& driftCmp,
-    Garfield::ComponentAnalyticField& wcmp,
+    Garfield::Component& weightingCmp,
     const std::vector<ReadoutStrip>& strips,
     const std::vector<std::array<double, 4>>& primaries,
     const AvalanchePassConfig& pc,
@@ -409,7 +400,13 @@ unsigned long RunAvalanchePass(
        instead of straight into the solver, so the caller can blend
        iterations. Each thread fills a private copy which is summed at
        the end, so this is safe in parallel. */
-    ChargeGrid* scGrid = nullptr);
+    ChargeGrid* scGrid = nullptr,
+    /* Optional decomposition of the total signal. These arrays are filled
+       only when non-null. delayedSignalOut is meaningful only when
+       enableDelayedSignal=true and the weighting component supplies a
+       dynamic weighting potential or field. */
+    std::vector<std::vector<double>>* promptSignalOut = nullptr,
+    std::vector<std::vector<double>>* delayedSignalOut = nullptr);
 
 /* convergence scan
 G_e/G_eh vs step size at a fixed injection point; avalLadder must
