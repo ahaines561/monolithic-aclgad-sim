@@ -174,11 +174,19 @@ std::size_t DepositAvalancheCharge(const Garfield::AvalancheMC& aval,
 struct ChargeGrid {
   int nx = 0, ny = 0;
   double xMinCm = 0., xMaxCm = 0., yMinCm = 0., yMaxCm = 0.;
+  // Cached inverse node spacing. Charge deposition is in the avalanche
+  // hot path, so avoid recomputing two divisions for every drift segment.
+  double invDx = 0., invDy = 0.;
   std::vector<double> rho;       // charge per node [e / cm of depth]
 
   void Init(const SpaceChargeConfig& cfg);
   void Clear() { std::fill(rho.begin(), rho.end(), 0.); }
-  void Deposit(double xCm, double yCm, double q);   // cloud-in-cell
+  bool Contains(double xCm, double yCm) const noexcept {
+    return xCm >= xMinCm && xCm <= xMaxCm &&
+           yCm >= yMinCm && yCm <= yMaxCm;
+  }
+  void Deposit(double xCm, double yCm, double q);   // checked cloud-in-cell
+  void DepositUnchecked(double xCm, double yCm, double q) noexcept;
   double Total() const;
   double AbsoluteTotal() const;
   double NodeX(int ix) const;
@@ -196,6 +204,9 @@ std::size_t DepositAvalancheIntoGrid(const Garfield::AvalancheMC& aval,
 /* mixed = (1-lambda)*mixed + lambda*fresh, then push the result into the
    Poisson solver (ClearCharge + one AddCharge per non-empty node).
    Does NOT call Solve(). */
+void LoadChargeGrid(Garfield::ComponentPoisson2d& sc,
+                    const ChargeGrid& grid);
+
 void ApplyRelaxedCharge(Garfield::ComponentPoisson2d& sc, ChargeGrid& mixed,
                         const ChargeGrid& fresh, double lambda);
 
@@ -373,6 +384,10 @@ struct AvalanchePassConfig {
   bool enableDelayedSignal = false;
   std::vector<double> delayedSignalTimesNs;
   std::size_t delayedSignalAveragingOrder = 0;
+
+  // Dynamic OpenMP chunk. Small chunks improve load balance because
+  // avalanche sizes vary strongly from one primary pair to another.
+  int ompDynamicChunk = 4;
 
   // Optional serial execution for debugging or thread-safety studies.
   bool forceSerial = false;

@@ -309,6 +309,30 @@ void ConfigureAvalanche(AvalancheMC& av, double& stepCm, double bulkStepCm,
       });
 }
 
+namespace {
+// Production avalanche configuration. Unlike ConfigureAvalanche, this
+// callback performs no atomic diagnostics on every drift step. The
+// instrumented version remains available for convergence/feedback scans.
+void ConfigureAvalancheFast(AvalancheMC& av, const double fineStepCm,
+                            const double bulkStepCm,
+                            const double yFineLoCm,
+                            const double yFineHiCm,
+                            const double timeWindowNs,
+                            const std::size_t sizeCap,
+                            const bool enableSignal) {
+  av.EnableMultithreading(false);
+  av.EnableSignalCalculation(enableSignal);
+  av.SetTimeWindow(0., timeWindowNs);
+  av.EnableAvalancheSizeLimit(sizeCap);
+  av.SetStepDistanceFunction(
+      [fineStepCm, bulkStepCm, yFineLoCm, yFineHiCm]
+      (double, const double y, double) noexcept {
+        return y > yFineLoCm && y < yFineHiCm
+            ? fineStepCm : bulkStepCm;
+      });
+}
+}  // namespace
+
 // per-strip weighting potential over a grid, to a text file:
 // x_um,y_um,<label>_phi,...
 void DumpWeightingField(ComponentAnalyticField& wcmp,
@@ -442,15 +466,11 @@ unsigned long RunAvalanchePass(
     }
     #pragma omp barrier
 
-    double stepCm = pc.fineStepCm;
-    // nPrinted seeded high so worker threads don't each dump 5 stepfn lines
-    std::atomic<long long> nCalls{0}, nFine{0}, nCoarse{0}, nPrinted{1000};
     AvalancheMC localAval;
     localAval.SetSensor(&localSensor);
-    ConfigureAvalanche(localAval, stepCm, pc.bulkStepCm, pc.yFineLoCm,
-                       pc.yFineHiCm, pc.timeWindowNs, pc.sizeCap,
-                       pc.enableSignal, /*multithreading=*/false,
-                       tag, nCalls, nFine, nCoarse, nPrinted);
+    ConfigureAvalancheFast(localAval, pc.fineStepCm, pc.bulkStepCm,
+                           pc.yFineLoCm, pc.yFineHiCm, pc.timeWindowNs,
+                           pc.sizeCap, pc.enableSignal);
     localAval.EnableDiffusion(pc.diffusion);
     localAval.EnableMultiplication(pc.multiplication);
     // drift paths are stored only when we need them to deposit space
@@ -467,7 +487,7 @@ unsigned long RunAvalanchePass(
     ChargeGrid localGrid;
     if (scGrid && scCfg) { localGrid = *scGrid; localGrid.Clear(); }
 
-    #pragma omp for schedule(dynamic, 16) reduction(+ : nTotal)
+    #pragma omp for schedule(dynamic, pc.ompDynamicChunk) reduction(+ : nTotal)
     for (long long i = 0; i < nPrim; ++i) {
       const auto& p = primaries[i];
       localAval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
@@ -1129,6 +1149,8 @@ void ChargeGrid::Init(const SpaceChargeConfig& cfg) {
   ny = std::max(2, cfg.mixNy);
   xMinCm = cfg.xMinCm; xMaxCm = cfg.xMaxCm;
   yMinCm = cfg.yMinCm; yMaxCm = cfg.yMaxCm;
+  invDx = static_cast<double>(nx - 1) / (xMaxCm - xMinCm);
+  invDy = static_cast<double>(ny - 1) / (yMaxCm - yMinCm);
   rho.assign(static_cast<std::size_t>(nx) * ny, 0.);
 }
 
@@ -1154,25 +1176,30 @@ double ChargeGrid::AbsoluteTotal() const {
    dumping the whole cell's charge at its centre. */
 void ChargeGrid::Deposit(const double xCm, const double yCm,
                          const double q) {
-  if (nx < 2 || ny < 2) return;
-  const double dx = (xMaxCm - xMinCm) / (nx - 1);
-  const double dy = (yMaxCm - yMinCm) / (ny - 1);
-  if (dx <= 0. || dy <= 0.) return;
-  if (xCm < xMinCm || xCm > xMaxCm ||
-      yCm < yMinCm || yCm > yMaxCm) return;
-  const double gx = std::clamp((xCm - xMinCm) / dx, 0., double(nx - 1));
-  const double gy = std::clamp((yCm - yMinCm) / dy, 0., double(ny - 1));
-  const int ix = std::min(nx - 2, static_cast<int>(std::floor(gx)));
-  const int iy = std::min(ny - 2, static_cast<int>(std::floor(gy)));
-  const double fx = std::clamp(gx - ix, 0., 1.);
-  const double fy = std::clamp(gy - iy, 0., 1.);
-  const auto idx = [&](int a, int b) {
-    return static_cast<std::size_t>(b) * nx + a;
-  };
-  rho[idx(ix,     iy    )] += q * (1. - fx) * (1. - fy);
-  rho[idx(ix + 1, iy    )] += q * fx        * (1. - fy);
-  rho[idx(ix,     iy + 1)] += q * (1. - fx) * fy;
-  rho[idx(ix + 1, iy + 1)] += q * fx        * fy;
+  if (nx < 2 || ny < 2 || invDx <= 0. || invDy <= 0.) return;
+  if (!Contains(xCm, yCm)) return;
+  DepositUnchecked(xCm, yCm, q);
+}
+
+void ChargeGrid::DepositUnchecked(const double xCm, const double yCm,
+                                  const double q) noexcept {
+  const double gx = (xCm - xMinCm) * invDx;
+  const double gy = (yCm - yMinCm) * invDy;
+  const int ix = std::min(nx - 2, std::max(0, static_cast<int>(gx)));
+  const int iy = std::min(ny - 2, std::max(0, static_cast<int>(gy)));
+  const double fx = std::min(1., std::max(0., gx - ix));
+  const double fy = std::min(1., std::max(0., gy - iy));
+
+  const std::size_t i00 = static_cast<std::size_t>(iy) * nx + ix;
+  const std::size_t i10 = i00 + 1;
+  const std::size_t i01 = i00 + nx;
+  const std::size_t i11 = i01 + 1;
+  const double wx0 = 1. - fx;
+  const double wy0 = 1. - fy;
+  rho[i00] += q * wx0 * wy0;
+  rho[i10] += q * fx  * wy0;
+  rho[i01] += q * wx0 * fy;
+  rho[i11] += q * fx  * fy;
 }
 
 std::size_t DepositAvalancheIntoGrid(const AvalancheMC& aval,
@@ -1194,9 +1221,8 @@ std::size_t DepositAvalancheIntoGrid(const AvalancheMC& aval,
         if (dt <= 0.) continue;
         const double xm = 0.5 * (p0.x + p1.x);
         const double ym = 0.5 * (p0.y + p1.y);
-        if (xm < grid.xMinCm || xm > grid.xMaxCm ||
-            ym < grid.yMinCm || ym > grid.yMaxCm) { ++nOutside; continue; }
-        grid.Deposit(xm, ym, w * dt);
+        if (!grid.Contains(xm, ym)) { ++nOutside; continue; }
+        grid.DepositUnchecked(xm, ym, w * dt);
       }
     }
   };
@@ -1207,6 +1233,44 @@ std::size_t DepositAvalancheIntoGrid(const AvalancheMC& aval,
               << " stored path -- set aval.EnableDriftLines(true)\n";
   }
   return nOutside;
+}
+
+void LoadChargeGrid(ComponentPoisson2d& sc, const ChargeGrid& grid) {
+  sc.ClearCharge();
+  std::size_t nAccepted = 0, nRejected = 0;
+  const double dx = grid.nx > 1
+      ? (grid.xMaxCm - grid.xMinCm) / (grid.nx - 1) : 0.;
+  const double dy = grid.ny > 1
+      ? (grid.yMaxCm - grid.yMinCm) / (grid.ny - 1) : 0.;
+  // Exact boundary coordinates may not belong to a FEM element under
+  // strict lookup tests. Nudge boundary grid nodes a negligible distance
+  // inside while retaining their charge and relative position.
+  const double epsX = std::max(1.e-12, 1.e-6 * std::abs(dx));
+  const double epsY = std::max(1.e-12, 1.e-6 * std::abs(dy));
+  for (int iy = 0; iy < grid.ny; ++iy) {
+    for (int ix = 0; ix < grid.nx; ++ix) {
+      const double q = grid.rho[static_cast<std::size_t>(iy) * grid.nx + ix];
+      if (q == 0.) continue;
+      const double x = std::clamp(grid.NodeX(ix),
+                                  grid.xMinCm + epsX,
+                                  grid.xMaxCm - epsX);
+      const double y = std::clamp(grid.NodeY(iy),
+                                  grid.yMinCm + epsY,
+                                  grid.yMaxCm - epsY);
+      if (sc.AddCharge(x, y, q)) {
+        ++nAccepted;
+      } else {
+        ++nRejected;
+      }
+    }
+  }
+  if (nAccepted == 0) {
+    std::cerr << "  [spacecharge] WARNING: no charge accepted by the solver"
+              << " -- is the mixing grid inside the FEM region?\n";
+  } else if (nRejected > 0) {
+    std::cerr << "  [spacecharge] WARNING: " << nRejected
+              << " nonzero mixing-grid nodes were rejected by AddCharge.\n";
+  }
 }
 
 void ApplyRelaxedCharge(ComponentPoisson2d& sc, ChargeGrid& mixed,
@@ -1222,40 +1286,6 @@ void ApplyRelaxedCharge(ComponentPoisson2d& sc, ChargeGrid& mixed,
   for (std::size_t i = 0; i < mixed.rho.size(); ++i) {
     mixed.rho[i] = (1. - lam) * mixed.rho[i] + lam * fresh.rho[i];
   }
-  sc.ClearCharge();
-  std::size_t nAccepted = 0, nRejected = 0;
-  const double dx = mixed.nx > 1
-      ? (mixed.xMaxCm - mixed.xMinCm) / (mixed.nx - 1) : 0.;
-  const double dy = mixed.ny > 1
-      ? (mixed.yMaxCm - mixed.yMinCm) / (mixed.ny - 1) : 0.;
-  // Exact boundary coordinates may not belong to a FEM element under
-  // strict lookup tests. Nudge boundary grid nodes a negligible distance
-  // inside while retaining their charge and relative position.
-  const double epsX = std::max(1.e-12, 1.e-6 * std::abs(dx));
-  const double epsY = std::max(1.e-12, 1.e-6 * std::abs(dy));
-  for (int iy = 0; iy < mixed.ny; ++iy) {
-    for (int ix = 0; ix < mixed.nx; ++ix) {
-      const double q = mixed.rho[static_cast<std::size_t>(iy) * mixed.nx + ix];
-      if (q == 0.) continue;
-      const double x = std::clamp(mixed.NodeX(ix),
-                                  mixed.xMinCm + epsX,
-                                  mixed.xMaxCm - epsX);
-      const double y = std::clamp(mixed.NodeY(iy),
-                                  mixed.yMinCm + epsY,
-                                  mixed.yMaxCm - epsY);
-      if (sc.AddCharge(x, y, q)) {
-        ++nAccepted;
-      } else {
-        ++nRejected;
-      }
-    }
-  }
-  if (nAccepted == 0) {
-    std::cerr << "  [spacecharge] WARNING: no charge accepted by the solver"
-              << " -- is the mixing grid inside the FEM region?\n";
-  } else if (nRejected > 0) {
-    std::cerr << "  [spacecharge] WARNING: " << nRejected
-              << " nonzero mixing-grid nodes were rejected by AddCharge.\n";
-  }
+  LoadChargeGrid(sc, mixed);
 }
 

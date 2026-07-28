@@ -124,44 +124,40 @@ static void DumpCombinedFieldProfile(
 struct RunConfig {
   std::string file = "/home/ahaines561/HEP/MAS/Silvaco_dat/"
                         // "diode.sta";
-                        // "lgad150V.sta";
-                        "lgad180V.sta";
+                        "lgad150V.sta";
+                        // "lgad180V.sta";
                         // "lgad190V.sta";
                         // "aclgad.sta";
-  std::string outDir = "output_files_x20_2/";
+  std::string outDir = "output_files_150V/";
 
   double biasVOverride = std::numeric_limits<double>::quiet_NaN();
   double xTrackUm = 20.;  // MIP track position
-  bool doWeightingDump = true; // DumpWeightingField
+  bool doWeightingDump = false; // DumpWeightingField
   bool doConvergenceScan = false;  // legacy G_e/G_eh step ladder
   bool doFeedbackScan = false;     // explicit e_no_holes/e_full/h_full/eh_full
   bool doModelComparison = false;  // deprecated alias for doFeedbackScan
   bool doMIP = true;
 
-  // Multi-MIP ensemble controls. Each event is an independent HEED track and
-  // avalanche realization. Ensemble means and spreads, rather than replay of
-  // a particular random stream, are the statistical observables.
-  int nMips = 20;
+  int nMips = 3;
   int mipEventOffset = 0;
-  bool mipRunStatic = true;
+  bool mipRunStatic = false;
   bool mipRunScreened = true;
-  bool mipWriteOverlaySignals = false;
+  bool mipWriteOverlaySignals = true;
   bool mipWritePerEventSignals = false;
   bool mipWritePairFiles = false;
-  bool mipWritePrimaries = true;
+  bool mipWritePrimaries = false;
+
   int mipProgressEvery = 1;
   unsigned long mipPairProgressEvery = 0;
-
-  // Optional repeated avalanches on a frozen field. These consume the normal
+  int avalancheOmpChunk = 4;
+  bool mipForceSerialAvalanches = false;   // Use outer OpenMP transport parallelism.
+  // # repeated avalanches on a frozen field
   // continuing Garfield random stream; no custom reseeding is performed.
   int mipFinalSampleCount = 0;
   bool mipFinalSampleEnableSignal = true;
 
   bool silenceGarfieldSensorSetup = true;
-
-  // Delayed weighting-signal plumbing. Keep disabled while the weighting
-  // component is ComponentAnalyticField; enable only after registering a
-  // component that supplies dynamic weighting potentials/fields.
+  // weighting field -- delayed signal calculation
   bool enableDelayedSignal = false;
   std::vector<double> delayedSignalTimesNs = {
       0., 0.02, 0.05, 0.1, 0.2, 0.5, 1., 2., 5., 10., 20., 50., 100.};
@@ -186,7 +182,7 @@ struct RunConfig {
   unsigned int siliconRegion = 0;
   bool assignAllRegionsToSilicon = false;  // diagnostic escape hatch only
   double driftWindowNs = 4.; // must exceed the 4ns signal window
-  double fineStepNm = 50.; // step size inside the gain-layer band
+  double fineStepNm = 100.; // step size inside the gain-layer band
   double bulkStepNm = 250.;  // step size everywhere else
   double fineBandHalfWidthUm = 2.5;  // band = [yGain-this, yGain+this]
   double activeFieldMinVcm = 100.;
@@ -195,10 +191,10 @@ struct RunConfig {
   double scZExtentUm = 0.21;
   int scMaxIter = 16;
   double scRelaxation = 0.25;     // damps stochastic avalanche forcing
-  bool scWriteIterationHistory = true;
+  bool scWriteIterationHistory = false;
   // 0 = quiet (only final per-event result), 1 = one line per iteration,
   // 2 = detailed charge/field diagnostics.
-  int scConsoleVerbosity = 0;
+  int scConsoleVerbosity = 1;
   double scGainTol = 0.01;  // diagnostic only; gain does not gate stopping
   double scFieldTol = 0.01;
   int scStableIterations = 3;
@@ -208,9 +204,15 @@ struct RunConfig {
   int scFieldSampleNy = 41;
   double scFieldSampleXHalfWidthUm = 5.;
   double scFieldSampleYHalfWidthUm = 1.;
-  bool scWriteFinalFieldProfile = true;
+  bool scWriteFinalFieldProfile = false;
   int scFinalFieldProfilePoints = 801;
   bool scFinalEvaluationPass = true;
+  // Reuse the previous event's converged charge cloud as the initial guess,
+  // scaled by primary-pair count. The normal convergence test still applies.
+  bool scWarmStartEvents = true;
+  double scWarmStartScaleMin = 0.5;
+  double scWarmStartScaleMax = 2.0;
+  bool scPrintStageTimings = true;
 };
 
 int main() {
@@ -531,6 +533,8 @@ int main() {
   pc.xMax = bx1; pc.yMax = yBot;           pc.zMax = 5.e-4;
   pc.tStart = 0.; pc.tStep = 0.005; pc.nBins = 800;
   pc.enableSignal = true;
+  pc.ompDynamicChunk = std::max(1, cfg.avalancheOmpChunk);
+  pc.forceSerial = cfg.mipForceSerialAvalanches;
   pc.enableDelayedSignal = cfg.enableDelayedSignal;
   pc.delayedSignalTimesNs = cfg.delayedSignalTimesNs;
   pc.delayedSignalAveragingOrder = cfg.delayedSignalAveragingOrder;
@@ -662,7 +666,14 @@ int main() {
          << cfg.scFinalFieldProfilePoints
          << "\nscFinalEvaluationPass="
          << (cfg.scFinalEvaluationPass ? 1 : 0)
+         << "\nscWarmStartEvents=" << (cfg.scWarmStartEvents ? 1 : 0)
+         << "\nscWarmStartScaleMin=" << cfg.scWarmStartScaleMin
+         << "\nscWarmStartScaleMax=" << cfg.scWarmStartScaleMax
+         << "\nscPrintStageTimings=" << (cfg.scPrintStageTimings ? 1 : 0)
+         << "\navalancheOmpChunk=" << cfg.avalancheOmpChunk
          << "\nrngMode=continuousGarfieldStream"
+         << "\nmipForceSerialAvalanches="
+         << (cfg.mipForceSerialAvalanches ? 1 : 0)
          << "\nenableDelayedSignal=" << (cfg.enableDelayedSignal ? 1 : 0)
          << "\ndelayedSignalAveragingOrder="
          << cfg.delayedSignalAveragingOrder
@@ -730,6 +741,11 @@ int main() {
     fEvents << "\n";
   };
 
+  ChargeGrid previousConvergedGrid;
+  bool havePreviousConvergedGrid = false;
+  unsigned long previousConvergedPrimary = 0;
+  if (actuallyRunScreened) previousConvergedGrid.Init(scCfg);
+
   for (int iMip = 0; iMip < cfg.nMips; ++iMip) {
     const int eventId = cfg.mipEventOffset + iMip;
     const auto tEventStart = Clock::now();
@@ -762,8 +778,13 @@ int main() {
     AvalanchePassConfig pcOff = pc;
     pcOff.multiplication = false;
     std::vector<std::vector<double>> sigOff;
+    const auto tGainOff = Clock::now();
     RunAvalanchePass(cmp, wcmp, strips, primaries, pcOff, sigOff, nullptr,
                      cfg.mipPairProgressEvery, "GAIN_OFF");
+    const double gainOffS = ElapsedS(tGainOff);
+    if (cfg.scPrintStageTimings) {
+      std::cout << "  [timing] gain-off transport=" << gainOffS << " s\n";
+    }
     const SignalMetrics offMetrics = MeasureSignal(sigOff);
     overlayEventIds.push_back(eventId);
     overlayPrimaryCounts.push_back(nPrimary);
@@ -873,13 +894,6 @@ int main() {
       const auto t0 = Clock::now();
       screenedResult.ran = true;
 
-      // Reset the perturbation before every new MIP. Without the zero-charge
-      // solve, the first iteration of event N would inherit event N-1's field.
-      scField.ClearCharge();
-      if (!scField.Solve()) {
-        std::cerr << "  [spacecharge] zero-field reset failed.\n";
-      }
-
       double gainPrev = std::numeric_limits<double>::quiet_NaN();
       ScreeningFieldGridSample fieldGridPrev;
       bool haveFieldGridPrev = false;
@@ -895,11 +909,50 @@ int main() {
       mixed.Init(scCfg);
       fresh.Init(scCfg);
 
+      bool usedWarmStart = false;
+      if (cfg.scWarmStartEvents && havePreviousConvergedGrid &&
+          previousConvergedPrimary > 0) {
+        mixed = previousConvergedGrid;
+        const double rawScale = static_cast<double>(nPrimary) /
+                                previousConvergedPrimary;
+        const double scaleLo = std::min(cfg.scWarmStartScaleMin,
+                                        cfg.scWarmStartScaleMax);
+        const double scaleHi = std::max(cfg.scWarmStartScaleMin,
+                                        cfg.scWarmStartScaleMax);
+        const double scale = std::clamp(rawScale, scaleLo, scaleHi);
+        for (double& q : mixed.rho) q *= scale;
+        LoadChargeGrid(scField, mixed);
+        if (scField.Solve()) {
+          usedWarmStart = true;
+          // Compare the first new update against the warm-start field rather
+          // than discarding that useful first residual.
+          fieldGridPrev = SampleScreeningFieldGrid(scField, scCfg);
+          haveFieldGridPrev = true;
+          if (cfg.scConsoleVerbosity >= 1) {
+            std::cout << "  [spacecharge] warm start from previous event"
+                      << " (primary scale=" << scale << ")\n";
+          }
+        } else {
+          std::cerr << "  [spacecharge] warm-start solve failed; "
+                       "falling back to zero.\n";
+          mixed.Clear();
+        }
+      }
+      if (!usedWarmStart) {
+        scField.ClearCharge();
+        if (!scField.Solve()) {
+          std::cerr << "  [spacecharge] zero-field reset failed.\n";
+        }
+      }
+
       // Space-charge iterations use the ordinary stochastic Garfield stream.
       AvalanchePassConfig pcIter = pc;
       // Intermediate signals are discarded. Disabling them avoids the
       // weighting-field work and signal-bin accumulation on every iteration.
       pcIter.enableSignal = false;
+      bool haveConvergedIterationSignal = false;
+      unsigned long convergedIterationTotal = 0;
+      std::vector<std::vector<double>> convergedIterationSignal;
 
       for (int it = 0; it < scCfg.maxIter; ++it) {
         if (cfg.scConsoleVerbosity >= 2) {
@@ -908,18 +961,37 @@ int main() {
         }
         const auto inputFieldSample = SampleScreeningField(scField, scCfg);
         fresh.Clear();
+        // When the exact final evaluation is disabled, calculate a signal on
+        // the likely final iteration. If this iteration converges, that signal
+        // can be reused and one full avalanche pass is avoided.
+        pcIter.enableSignal = !cfg.scFinalEvaluationPass &&
+            !cfg.mipWritePairFiles &&
+            stableCount >= std::max(0, scCfg.stableIterations - 1);
+
+        const auto tTransport = Clock::now();
         nIterTotal = RunAvalanchePass(
             cmp, wcmp, strips, primaries, pcIter, sigIter, nullptr,
             cfg.mipPairProgressEvery, "SCREEN_ITER", &scField, nullptr,
             &scCfg, &fresh);
+        const double transportS = ElapsedS(tTransport);
+
+        const auto tApply = Clock::now();
         ApplyRelaxedCharge(scField, mixed, fresh, scCfg.relaxation);
-        if (!scField.Solve()) {
+        const double applyS = ElapsedS(tApply);
+
+        const auto tSolve = Clock::now();
+        const bool solved = scField.Solve();
+        const double solveS = ElapsedS(tSolve);
+        if (!solved) {
           std::cerr << "  [spacecharge] Solve() failed; stopping iterations.\n";
           break;
         }
+
+        const auto tSample = Clock::now();
         screenedResult.scIterations = it + 1;
         screenedResult.scSample = SampleScreeningField(scField, scCfg);
         const auto fieldGrid = SampleScreeningFieldGrid(scField, scCfg);
+        const double sampleS = ElapsedS(tSample);
         const auto fieldChange = haveFieldGridPrev
             ? CompareScreeningFieldGrids(fieldGridPrev, fieldGrid)
             : ScreeningFieldChange{};
@@ -949,6 +1021,17 @@ int main() {
         }
         const bool convergedNow =
             stableCount >= std::max(1, scCfg.stableIterations);
+        if (cfg.scPrintStageTimings) {
+          std::cout << "    [timing] transport=" << transportS
+                    << " s apply=" << applyS
+                    << " s solve=" << solveS
+                    << " s sample=" << sampleS << " s\n";
+        }
+        if (convergedNow && pcIter.enableSignal) {
+          haveConvergedIterationSignal = true;
+          convergedIterationTotal = nIterTotal;
+          convergedIterationSignal = sigIter;
+        }
         if (iterCsv.is_open()) {
           iterCsv << eventId << "," << it + 1 << ","
                   << scCfg.relaxation << "," << nPrimary << ","
@@ -971,6 +1054,12 @@ int main() {
         haveFieldGridPrev = true;
       }
 
+      if (cfg.scWarmStartEvents && screenedResult.scConverged) {
+        previousConvergedGrid = mixed;
+        previousConvergedPrimary = nPrimary;
+        havePreviousConvergedGrid = true;
+      }
+
       std::ofstream pairs;
       std::ofstream* pairPtr = nullptr;
       if (cfg.mipWritePairFiles) {
@@ -981,14 +1070,35 @@ int main() {
         pairPtr = &pairs;
       }
 
-      // Intermediate iterations deliberately have signal calculation off,
-      // so a final evaluation pass is required for the waveform and gain.
       AvalanchePassConfig pcFinal = pc;
       pcFinal.multiplication = true;
       pcFinal.enableSignal = true;
-      screenedResult.nTotal = RunAvalanchePass(
-          cmp, wcmp, strips, primaries, pcFinal, screenedResult.signal,
-          pairPtr, cfg.mipPairProgressEvery, "SCREEN_FINAL", &scField);
+      if (!cfg.scFinalEvaluationPass && !cfg.mipWritePairFiles &&
+          haveConvergedIterationSignal) {
+        screenedResult.nTotal = convergedIterationTotal;
+        screenedResult.signal = std::move(convergedIterationSignal);
+        if (cfg.scPrintStageTimings) {
+          std::cout << "  [timing] reused converged-iteration signal; "
+                       "skipped SCREEN_FINAL\n";
+        }
+      } else {
+        if (!cfg.scFinalEvaluationPass && cfg.mipWritePairFiles) {
+          std::cout << "  [spacecharge] pair-file output requires "
+                       "SCREEN_FINAL.\n";
+        } else if (!cfg.scFinalEvaluationPass &&
+                   !haveConvergedIterationSignal) {
+          std::cerr << "  [spacecharge] no converged iteration signal was "
+                       "available; running SCREEN_FINAL.\n";
+        }
+        const auto tFinal = Clock::now();
+        screenedResult.nTotal = RunAvalanchePass(
+            cmp, wcmp, strips, primaries, pcFinal, screenedResult.signal,
+            pairPtr, cfg.mipPairProgressEvery, "SCREEN_FINAL", &scField);
+        if (cfg.scPrintStageTimings) {
+          std::cout << "  [timing] final screened transport="
+                    << ElapsedS(tFinal) << " s\n";
+        }
+      }
       screenedResult.scSample = SampleScreeningField(scField, scCfg);
       if (cfg.scWriteFinalFieldProfile) {
         const std::string fieldPath = cfg.outDir + "spacecharge_field" +
