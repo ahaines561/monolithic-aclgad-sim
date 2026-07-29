@@ -124,24 +124,24 @@ static void DumpCombinedFieldProfile(
 struct RunConfig {
   std::string file = "/home/ahaines561/HEP/MAS/Silvaco_dat/"
                         // "diode.sta";
-                        "lgad150V.sta";
+                        // "lgad150V.sta";
                         // "lgad180V.sta";
                         // "lgad190V.sta";
-                        // "aclgad.sta";
-  std::string outDir = "output_files_150V/";
+                        "aclgad.sta";
+  std::string outDir = "output_files_aclgad/";
 
   double biasVOverride = std::numeric_limits<double>::quiet_NaN();
-  double xTrackUm = 20.;  // MIP track position
+  double xTrackUm = 250.;  // MIP track position
   bool doWeightingDump = false; // DumpWeightingField
   bool doConvergenceScan = false;  // legacy G_e/G_eh step ladder
   bool doFeedbackScan = false;     // explicit e_no_holes/e_full/h_full/eh_full
   bool doModelComparison = false;  // deprecated alias for doFeedbackScan
   bool doMIP = true;
 
-  int nMips = 3;
+  int nMips = 5;
   int mipEventOffset = 0;
-  bool mipRunStatic = false;
-  bool mipRunScreened = true;
+  bool mipRunStatic = true;
+  bool mipRunScreened = false;
   bool mipWriteOverlaySignals = true;
   bool mipWritePerEventSignals = false;
   bool mipWritePairFiles = false;
@@ -150,7 +150,9 @@ struct RunConfig {
   int mipProgressEvery = 1;
   unsigned long mipPairProgressEvery = 0;
   int avalancheOmpChunk = 4;
-  bool mipForceSerialAvalanches = false;   // Use outer OpenMP transport parallelism.
+  bool mipForceSerialAvalanches = true;   // Use outer OpenMP transport parallelism.
+  bool EnableDiffusion = true;
+  bool EnableMultiplication = true;
   // # repeated avalanches on a frozen field
   // continuing Garfield random stream; no custom reseeding is performed.
   int mipFinalSampleCount = 0;
@@ -164,7 +166,7 @@ struct RunConfig {
   std::size_t delayedSignalAveragingOrder = 2;
 
   std::string model = "okuto";
-  double temperatureK = 293.15;
+  double temperatureK = 300.0;
 
   // Feedback-scan controls.
   std::vector<std::string> feedbackModels = {};  // empty = use cfg.model
@@ -182,12 +184,12 @@ struct RunConfig {
   unsigned int siliconRegion = 0;
   bool assignAllRegionsToSilicon = false;  // diagnostic escape hatch only
   double driftWindowNs = 4.; // must exceed the 4ns signal window
-  double fineStepNm = 100.; // step size inside the gain-layer band
+  double fineStepNm = 75.; // step size inside the gain-layer band
   double bulkStepNm = 250.;  // step size everywhere else
   double fineBandHalfWidthUm = 2.5;  // band = [yGain-this, yGain+this]
   double activeFieldMinVcm = 100.;
 
-  bool spaceCharge = true;  // master switch for the Poisson correction
+  bool spaceCharge = false;  // master switch for the Poisson correction
   double scZExtentUm = 0.21;
   int scMaxIter = 16;
   double scRelaxation = 0.25;     // damps stochastic avalanche forcing
@@ -358,15 +360,15 @@ int main() {
   }
 
   // strips canode/cathode
-  // const std::vector<ReadoutStrip> strips = {
-  //   {"strip0",  50., 20.},
-  //   {"strip1", 245., 25.},
-  //   {"strip2", 450., 20.},
-  // };
   const std::vector<ReadoutStrip> strips = {
-    {"anode",  22.5, 22.5},
-    {"cathode", 77.5, 22.5},
+    {"strip0",  50., 20.},
+    {"strip1", 245., 25.},
+    {"strip2", 450., 20.},
   };
+  // const std::vector<ReadoutStrip> strips = {
+  //   {"anode",  22.5, 22.5},
+  //   {"cathode", 77.5, 22.5},
+  // };
   if (!StripsInsideMap(strips, bx0, bx1)) return 1;
 
   ComponentAnalyticField wcmp;
