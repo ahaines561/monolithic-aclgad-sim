@@ -12,6 +12,7 @@
 #include <iostream>
 #include <limits>
 #include <regex>
+#include <stdexcept>
 #include <sstream>
 
 #if defined(_OPENMP)
@@ -246,7 +247,7 @@ FieldDumpResult DumpElectricField(Component& cmp, double x0, double x1,
 /* weighting field
 - per-strip Ew/wpot startup check (probed just inside the gap) 
 -plus an overlap sanity check under strip0. Pure diagnostic printing. */
-void PrintWeightingSanity(ComponentAnalyticField& wcmp,
+void PrintWeightingSanity(Component& wcmp,
                           const std::vector<ReadoutStrip>& strips, double yTop,
                           double yBot) {
   for (const auto& s : strips) {
@@ -290,7 +291,19 @@ void ConfigureAvalanche(AvalancheMC& av, double& stepCm, double bulkStepCm,
                         std::atomic<long long>& nFine,
                         std::atomic<long long>& nCoarse,
                         std::atomic<long long>& nPrinted) {
-  av.EnableMultithreading(enableMultithreading);
+  // AvalancheMC has no DisableMultithreading(). The only entry point is
+  // EnableMultithreading(unsigned nThreads = 0), and nThreads < 1 is
+  // interpreted as "use hardware_concurrency()" (AvalancheMC.cc:1994).
+  // Passing a bool therefore requested MAXIMUM threading, not none.
+  // m_nThreads defaults to 1 (AvalancheMC.hh:347), so 1 == serial.
+  av.EnableMultithreading(enableMultithreading ? 0u : 1u);
+  // Pin the signal path. m_useWeightingPotential defaults to true
+  // (AvalancheMC.hh:317), but the choice must match which weighting store is
+  // actually populated: the potential path calls WeightingPotential() and
+  // DelayedWeightingPotentials(); the field path calls WeightingField() and
+  // DelayedWeightingField(). A mismatch is either an out-of-bounds read or a
+  // silently-zero delayed signal, so do not rely on the default.
+  av.UseWeightingPotential(true);
   av.EnableSignalCalculation(enableSignal);
   av.SetTimeWindow(0., timeWindowNs);
   av.EnableAvalancheSizeLimit(sizeCap);
@@ -320,7 +333,11 @@ void ConfigureAvalancheFast(AvalancheMC& av, const double fineStepCm,
                             const double timeWindowNs,
                             const std::size_t sizeCap,
                             const bool enableSignal) {
-  av.EnableMultithreading(false);
+  // See ConfigureAvalanche: DisableMultithreading() does not exist; 1 thread
+  // is serial, 0 would request hardware_concurrency(). Outer OpenMP
+  // parallelism over primaries must not nest with Garfield's internal threads.
+  av.EnableMultithreading(1u);
+  av.UseWeightingPotential(true);
   av.EnableSignalCalculation(enableSignal);
   av.SetTimeWindow(0., timeWindowNs);
   av.EnableAvalancheSizeLimit(sizeCap);
@@ -335,7 +352,7 @@ void ConfigureAvalancheFast(AvalancheMC& av, const double fineStepCm,
 
 // per-strip weighting potential over a grid, to a text file:
 // x_um,y_um,<label>_phi,...
-void DumpWeightingField(ComponentAnalyticField& wcmp,
+void DumpWeightingField(Component& wcmp,
                         const std::vector<ReadoutStrip>& strips, double bx0,
                         double bx1, double yTop, double yBot,
                         const std::string& outPath, int nx, int ny) {
@@ -361,6 +378,132 @@ void DumpWeightingField(ComponentAnalyticField& wcmp,
             << " s" << std::endl;
 }
 
+DelayedWeightingValidation ValidateDelayedWeightingData(
+    Component& weightingCmp, const std::vector<ReadoutStrip>& strips,
+    const double probeYCm) {
+  DelayedWeightingValidation out;
+  if (strips.empty()) {
+    out.message = "no readout electrodes were configured";
+    return out;
+  }
+
+  for (std::size_t k = 0; k < strips.size(); ++k) {
+    const auto& label = strips[k].label;
+    const auto& times = weightingCmp.DelayedSignalTimes(label);
+    if (times.empty()) {
+      out.message = "electrode '" + label +
+          "' has no delayed-weighting time slices";
+      return out;
+    }
+    if (!std::is_sorted(times.begin(), times.end()) ||
+        std::adjacent_find(times.begin(), times.end(),
+                           std::greater_equal<double>()) != times.end()) {
+      out.message = "electrode '" + label +
+          "' has a delayed-weighting time grid that is not strictly increasing";
+      return out;
+    }
+    if (times.front() < 0.) {
+      out.message = "electrode '" + label +
+          "' has a negative delayed-weighting time";
+      return out;
+    }
+    if (k == 0) {
+      out.timesNs = times;
+    } else if (times.size() != out.timesNs.size() ||
+               !std::equal(times.begin(), times.end(), out.timesNs.begin(),
+                           [](const double a, const double b) {
+                             const double scale =
+                                 std::max({1., std::abs(a), std::abs(b)});
+                             return std::abs(a - b) <= 1.e-10 * scale;
+                           })) {
+      out.message = "electrode '" + label +
+          "' uses a different delayed-weighting time grid";
+      out.timesNs.clear();
+      return out;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Live probe of the store the signal path will actually read.
+  //
+  // The checks above only inspect DelayedSignalTimes(), which is NOT
+  // sufficient: ComponentTcadBase::DelayedSignalTimes falls back from the
+  // potential store (m_dwtp) to the field store (m_dwtf), so it returns a
+  // non-empty grid in BOTH mismatch directions. We use the weighting-potential
+  // signal path (AvalancheMC::UseWeightingPotential(true)), which consumes
+  // WeightingPotential() and DelayedWeightingPotentials(). If only dynamic
+  // *fields* were loaded, the delayed signal is identically zero and the only
+  // warning goes to stderr -- which silenceGarfieldStderr sends to /dev/null.
+  // So probe the potentials directly and fail loudly here instead.
+  if (probeYCm > 0.) {
+    for (const auto& s : strips) {
+      const double xCm = s.centerUm * 1.e-4;
+      const double wpPrompt =
+          weightingCmp.WeightingPotential(xCm, probeYCm, 0., s.label);
+      if (!std::isfinite(wpPrompt)) {
+        out.message = "electrode '" + s.label +
+            "' returned a non-finite prompt weighting potential";
+        out.timesNs.clear();
+        return out;
+      }
+      // Pick a probe time strictly inside the grid and away from t = 0.
+      // At t = 0 the delayed remainder is zero BY CONSTRUCTION (Garfield
+      // subtracts the prompt component), so probing there would report a
+      // false failure. ComponentTcad2d never stores t = 0 in the delayed
+      // grid, but ComponentGrid and ComponentUser can.
+      double tMid = -1.;
+      for (std::size_t i = out.timesNs.size(); i-- > 0;) {
+        if (out.timesNs[i] > 0.) tMid = out.timesNs[i];
+        if (i <= out.timesNs.size() / 2 && tMid > 0.) break;
+      }
+      if (tMid <= 0.) {
+        out.message = "electrode '" + s.label +
+            "' has no delayed-weighting time greater than zero";
+        out.timesNs.clear();
+        return out;
+      }
+      double dwpMax = 0.;
+      for (const double y : {probeYCm, 0.5 * probeYCm, 2. * probeYCm}) {
+        const double dwp =
+            weightingCmp.DelayedWeightingPotential(xCm, y, 0., tMid, s.label);
+        if (!std::isfinite(dwp)) {
+          out.message = "electrode '" + s.label +
+              "' returned a non-finite delayed weighting potential at t = " +
+              std::to_string(tMid) + " ns";
+          out.timesNs.clear();
+          return out;
+        }
+        dwpMax = std::max(dwpMax, std::abs(dwp));
+      }
+      if (dwpMax <= 0.) {
+        out.message = "electrode '" + s.label +
+            "' has a delayed-weighting time grid but its delayed weighting "
+            "POTENTIAL is identically zero at t = " + std::to_string(tMid) +
+            " ns. The potential store is empty -- dynamic weighting FIELDS "
+            "were probably loaded instead of potentials, which the "
+            "UseWeightingPotential(true) signal path cannot read.";
+        out.timesNs.clear();
+        return out;
+      }
+      out.probedDelayedMax = std::max(out.probedDelayedMax, dwpMax);
+      static bool printedProbe = false;
+      if (printedProbe) continue;
+      std::cout << "[weighting probe] " << s.label
+                << ": prompt wp = " << wpPrompt << ", max |delayed wp| at t = "
+                << tMid << " ns = " << dwpMax << std::endl;
+      if (&s == &strips.back()) printedProbe = true;
+    }
+  } else {
+    std::cout << "[weighting probe] SKIPPED (no probe depth given); "
+              << "time-grid checks only" << std::endl;
+  }
+
+  out.available = true;
+  out.message = "dynamic weighting data available and non-null for all "
+                "electrodes";
+  return out;
+}
+
 /* parallel avalanche pass (OpenMP)
 - one Sensor + one AvalancheMC per thread; only the read-only field
   components are shared. Mirrors the pattern proven in 1000MIPs.cpp.
@@ -368,6 +511,7 @@ void DumpWeightingField(ComponentAnalyticField& wcmp,
 - without -fopenmp the pragmas are ignored and this runs serially */
 unsigned long RunAvalanchePass(
     Component& driftCmp, Component& weightingCmp,
+    const std::vector<Component*>& perStripWeighting,
     const std::vector<ReadoutStrip>& strips,
     const std::vector<std::array<double, 4>>& primaries,
     const AvalanchePassConfig& pc,
@@ -380,6 +524,36 @@ unsigned long RunAvalanchePass(
     std::vector<std::vector<double>>* promptSignalOut,
     std::vector<std::vector<double>>* delayedSignalOut) {
   const std::size_t nStrips = strips.size();
+  bool useDelayedSignal = false;
+  if (pc.enableSignal && pc.enableDelayedSignal) {
+    // Probe a quarter of the way into the bulk so a silently-empty delayed
+    // store is caught here rather than showing up as a missing slow lobe.
+    const auto delayed = ValidateDelayedWeightingData(
+        weightingCmp, strips, pc.yMin + 0.25 * (pc.yMax - pc.yMin));
+    if (!delayed.available) {
+      const std::string msg =
+          "RunAvalanchePass: delayed signal requested, but " +
+          delayed.message + ".";
+      if (pc.requireDelayedWeightingData) {
+        throw std::runtime_error(msg);
+      }
+      std::cerr << "WARNING: " << msg
+                << " Continuing with prompt signal only.\n";
+    } else {
+      useDelayedSignal = true;
+      if (!pc.delayedSignalTimesNs.empty()) {
+        const double tMaxRequested =
+            *std::max_element(pc.delayedSignalTimesNs.begin(),
+                              pc.delayedSignalTimesNs.end());
+        const double tEnd = pc.tStart + pc.tStep * pc.nBins;
+        if (tMaxRequested > tEnd + 1.e-12) {
+          std::cerr << "WARNING: delayed weighting data extend to "
+                    << tMaxRequested << " ns, beyond the signal window ending at "
+                    << tEnd << " ns; the slow lobe will be truncated.\n";
+        }
+      }
+    }
+  }
   signalOut.assign(nStrips, std::vector<double>(pc.nBins, 0.));
   if (promptSignalOut) {
     promptSignalOut->assign(nStrips, std::vector<double>(pc.nBins, 0.));
@@ -434,11 +608,16 @@ unsigned long RunAvalanchePass(
       // returning status 0. The screening perturbation is added second.
       if (scField) localSensor.AddComponent(scField);
       if (pc.enableSignal) {
-        for (const auto& s : strips) {
-          localSensor.AddElectrode(&weightingCmp, s.label);
+        for (std::size_t k = 0; k < strips.size(); ++k) {
+          // ComponentGrid ignores the label, so when a per-strip vector is
+          // supplied each electrode must come from its own component.
+          Component* wc = perStripWeighting.empty()
+                              ? &weightingCmp
+                              : perStripWeighting[k];
+          localSensor.AddElectrode(wc, strips[k].label);
         }
         localSensor.SetTimeWindow(pc.tStart, pc.tStep, pc.nBins);
-        if (pc.enableDelayedSignal) {
+        if (useDelayedSignal) {
           localSensor.EnableDelayedSignal();
           if (!pc.delayedSignalTimesNs.empty()) {
             localSensor.SetDelayedSignalTimes(pc.delayedSignalTimesNs);

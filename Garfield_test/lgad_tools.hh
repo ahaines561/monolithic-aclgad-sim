@@ -334,17 +334,39 @@ void ConfigureAvalanche(Garfield::AvalancheMC& av, double& stepCm,
 /* weighting field
 - per-strip Ew/wpot startup check (probed just inside the gap) 
 -plus an overlap sanity check under strip0. Pure diagnostic printing. */
-void PrintWeightingSanity(Garfield::ComponentAnalyticField& wcmp,
+void PrintWeightingSanity(Garfield::Component& wcmp,
                           const std::vector<ReadoutStrip>& strips, double yTop,
                           double yBot);
 
 // per-strip weighting potential over a grid, to a text file:
 // x_um,y_um,<label>_phi,...
-void DumpWeightingField(Garfield::ComponentAnalyticField& wcmp,
+void DumpWeightingField(Garfield::Component& wcmp,
                         const std::vector<ReadoutStrip>& strips, double bx0,
                         double bx1, double yTop, double yBot,
                         const std::string& outPath, int nx = 250,
                         int ny = 150);
+
+struct DelayedWeightingValidation {
+  bool available = false;
+  std::vector<double> timesNs;
+  std::string message;
+  // Largest |delayed weighting potential| seen by the live probe. Stays 0 if
+  // the probe was skipped (probeYCm <= 0).
+  double probedDelayedMax = 0.;
+};
+
+/* Check that every requested electrode label has the same non-empty,
+   strictly increasing delayed-weighting time grid, AND that the delayed
+   weighting POTENTIAL is actually non-null there.
+
+   The time-grid check alone is not sufficient: DelayedSignalTimes() falls back
+   from the potential store to the field store, so it succeeds even when the
+   store the signal path reads is empty. Pass probeYCm > 0 (a depth inside the
+   bulk, in cm) to enable the live probe; pass 0 to skip it. */
+DelayedWeightingValidation ValidateDelayedWeightingData(
+    Garfield::Component& weightingCmp,
+    const std::vector<ReadoutStrip>& strips,
+    double probeYCm = 0.);
 
 /* parallel avalanche pass (OpenMP)
 - one Sensor + one AvalancheMC per thread; only the read-only field
@@ -382,6 +404,9 @@ struct AvalanchePassConfig {
   // The weighting component registered with Sensor::AddElectrode must provide
   // DelayedWeightingPotential/Field for each requested electrode label.
   bool enableDelayedSignal = false;
+  // If true, an absent/inconsistent dynamic weighting map is an error.
+  // Keep this enabled for any run advertised as an AC-LGAD bipolar-signal run.
+  bool requireDelayedWeightingData = true;
   std::vector<double> delayedSignalTimesNs;
   std::size_t delayedSignalAveragingOrder = 0;
 
@@ -396,6 +421,11 @@ struct AvalanchePassConfig {
 unsigned long RunAvalanchePass(
     Garfield::Component& driftCmp,
     Garfield::Component& weightingCmp,
+    // Optional: one weighting component PER STRIP, aligned with `strips`.
+    // Required for ComponentGrid, which ignores the electrode label and can
+    // therefore hold only one electrode per instance. When empty, every strip
+    // is read from the single `weightingCmp`.
+    const std::vector<Garfield::Component*>& perStripWeighting,
     const std::vector<ReadoutStrip>& strips,
     const std::vector<std::array<double, 4>>& primaries,
     const AvalanchePassConfig& pc,

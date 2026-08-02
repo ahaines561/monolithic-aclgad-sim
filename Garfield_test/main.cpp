@@ -10,7 +10,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <memory>
 
+#include "Garfield/ComponentUser.hh"
 #include "Garfield/ComponentTcad2d.hh"
 #include "Garfield/ComponentConstant.hh"
 #include "Garfield/GeometrySimple.hh"
@@ -19,34 +21,89 @@
 #include "Garfield/TrackHeed.hh"
 
 #include "lgad_tools.hh"
+#include "sheet_weighting.hh"
 
 using namespace Garfield;
 
 
 struct SignalMetrics {
   std::vector<double> integral;
+  std::vector<double> positiveArea;
+  std::vector<double> negativeArea;
+  std::vector<double> absoluteArea;
   std::vector<double> peak;
+  std::vector<double> positivePeak;
+  std::vector<double> negativePeak;
+  std::vector<double> peakTimeNs;
+  std::vector<double> zeroCrossingAfterPeakNs;
   double totalIntegral = 0.;
+  double totalPositiveArea = 0.;
+  double totalNegativeArea = 0.;
+  double totalAbsoluteArea = 0.;
   std::size_t peakStrip = 0;
 };
 
 static SignalMetrics MeasureSignal(
-    const std::vector<std::vector<double>>& signal) {
+    const std::vector<std::vector<double>>& signal,
+    const double tStartNs, const double tStepNs) {
   SignalMetrics r;
-  r.integral.assign(signal.size(), 0.);
-  r.peak.assign(signal.size(), 0.);
-  for (std::size_t k = 0; k < signal.size(); ++k) {
-    for (const double sample : signal[k]) {
-      r.integral[k] += sample;
-      if (std::abs(sample) > std::abs(r.peak[k])) r.peak[k] = sample;
+  const std::size_t nStrips = signal.size();
+  r.integral.assign(nStrips, 0.);
+  r.positiveArea.assign(nStrips, 0.);
+  r.negativeArea.assign(nStrips, 0.);
+  r.absoluteArea.assign(nStrips, 0.);
+  r.peak.assign(nStrips, 0.);
+  r.positivePeak.assign(nStrips, 0.);
+  r.negativePeak.assign(nStrips, 0.);
+  r.peakTimeNs.assign(nStrips, std::numeric_limits<double>::quiet_NaN());
+  r.zeroCrossingAfterPeakNs.assign(
+      nStrips, std::numeric_limits<double>::quiet_NaN());
+
+  for (std::size_t k = 0; k < nStrips; ++k) {
+    std::size_t iPeak = 0;
+    for (std::size_t b = 0; b < signal[k].size(); ++b) {
+      const double sample = signal[k][b];
+      const double area = sample * tStepNs;
+      r.integral[k] += area;
+      r.absoluteArea[k] += std::abs(area);
+      if (area > 0.) r.positiveArea[k] += area;
+      if (area < 0.) r.negativeArea[k] += area;
+      if (sample > r.positivePeak[k]) r.positivePeak[k] = sample;
+      if (sample < r.negativePeak[k]) r.negativePeak[k] = sample;
+      if (std::abs(sample) > std::abs(r.peak[k])) {
+        r.peak[k] = sample;
+        iPeak = b;
+        r.peakTimeNs[k] = tStartNs + (b + 0.5) * tStepNs;
+      }
     }
+
+    if (!signal[k].empty() && r.peak[k] != 0.) {
+      const double peakSign = std::copysign(1., r.peak[k]);
+      for (std::size_t b = iPeak + 1; b < signal[k].size(); ++b) {
+        const double y0 = signal[k][b - 1];
+        const double y1 = signal[k][b];
+        if (peakSign * y0 > 0. && peakSign * y1 <= 0.) {
+          double fraction = 0.;
+          const double dy = y1 - y0;
+          if (dy != 0.) fraction = std::clamp(-y0 / dy, 0., 1.);
+          r.zeroCrossingAfterPeakNs[k] =
+              tStartNs + (static_cast<double>(b) - 0.5 + fraction) * tStepNs;
+          break;
+        }
+      }
+    }
+
     r.totalIntegral += r.integral[k];
+    r.totalPositiveArea += r.positiveArea[k];
+    r.totalNegativeArea += r.negativeArea[k];
+    r.totalAbsoluteArea += r.absoluteArea[k];
     if (k > 0 && std::abs(r.peak[k]) > std::abs(r.peak[r.peakStrip])) {
       r.peakStrip = k;
     }
   }
   return r;
 }
+
 
 static std::string EventTag(const int eventId) {
   std::ostringstream out;
@@ -138,7 +195,11 @@ struct RunConfig {
   bool doModelComparison = false;  // deprecated alias for doFeedbackScan
   bool doMIP = true;
 
-  int nMips = 5;
+  // Start small: the delayed-signal calculation costs roughly
+  // nSegments x nTimeBins per electrode (Sensor.cc:844-874), which is orders
+  // of magnitude more than a prompt-only run. Validate the waveform on a few
+  // events, then scale up.
+  int nMips = 2;
   int mipEventOffset = 0;
   bool mipRunStatic = true;
   bool mipRunScreened = false;
@@ -150,7 +211,10 @@ struct RunConfig {
   int mipProgressEvery = 1;
   unsigned long mipPairProgressEvery = 0;
   int avalancheOmpChunk = 4;
-  bool mipForceSerialAvalanches = true;   // Use outer OpenMP transport parallelism.
+  // Outer OpenMP parallelism over primaries. Safe now that
+  // EnableMultithreading(1) pins Garfield's internal avalanche threading and
+  // the weighting model is immutable and shared by const pointer.
+  bool mipForceSerialAvalanches = false;
   bool EnableDiffusion = true;
   bool EnableMultiplication = true;
   // # repeated avalanches on a frozen field
@@ -159,11 +223,66 @@ struct RunConfig {
   bool mipFinalSampleEnableSignal = true;
 
   bool silenceGarfieldSensorSetup = true;
-  // weighting field -- delayed signal calculation
-  bool enableDelayedSignal = false;
+
+  // Signal weighting model.
+  // false: static analytic strips (prompt-only LGAD reference).
+  // true: import prompt + time-dependent TCAD weighting potentials/fields.
+  bool useDynamicTcadWeighting = false;
+  std::string weightingGridFile = "";
+  std::string weightingBiasDataFile = "";
+  double weightingDeltaV = 1.0;
+  // Use SetDynamicWeightingPotential for a voltage-step boundary condition
+  // (dv * Theta(t)); set false only for impulse-field maps (dv * delta(t)).
+  bool dynamicWeightingUsesPotential = true;
   std::vector<double> delayedSignalTimesNs = {
       0., 0.02, 0.05, 0.1, 0.2, 0.5, 1., 2., 5., 10., 20., 50., 100.};
+  // One vector per readout strip, aligned with delayedSignalTimesNs.
+  std::vector<std::vector<std::string>> dynamicWeightingDataFiles;
   std::size_t delayedSignalAveragingOrder = 2;
+
+  /* Resistive-sheet weighting, solved in-process by sheet_weighting.hh.
+    This is the physically AC-coupled model: pads touch the n+ only through
+    C_ox and the only DC path is the bulk contact, so psi -> 0 and the induced charge integrates to zero on every pad -- the bipolar waveform
+    follows from the boundary conditions rather than being imposed. Set false for the prompt-only segmented-LGAD reference.
+    This is the physically AC-coupled configuration and the one that produces a bipolar waveform. It REQUIRES the exported weighting
+    tables; see the startup check below. To fall back to the prompt-onlly segmented-LGAD reference, set this to false. */
+  bool useResistiveGridWeighting = true;
+  /* Sheet parameters. R_sq is the one number not derivable from aclgad.sta:
+  the doping profile gives ~2740 ohm/sq at mu = 300, so record where 1500 comes from (measurement beats derivation, but it must be stated).
+  Derived from aclgad.sta: N_s = 7.58e12 cm^-2 of MOBILE electrons over the undepleted n+ (0 -> 0.43 um), uniform to ~1% across the active area, so
+    R_sq = 1/(q N_s mu_n) = 2740 ohm/sq at mu_n = 300 cm2/Vs.
+    mu = 250 -> 3290,  mu = 300 -> 2740,  mu = 350 -> 2350 ohm/sq. */
+  double sheetResistanceOhmSq = 2740.;
+  // 3.9 = SiO2, 7.5 = Si3N4. UNVERIFIED from the .sta -- every time constant
+  // scales with this.
+  double couplingEpsR = 3.9;
+  double couplingOxideThicknessUm = 0.1;
+  // Grounded DC contact on the n+ (the `bulk` electrode in the .sta).
+  double dcContactX0Um = 0.;
+  double dcContactX1Um = 5.;
+  std::size_t sheetNodes = 301;
+  std::size_t sheetOutY = 81;
+  std::size_t sheetStepsPerDecade = 60;
+  std::vector<double> resistiveWeightingTimesNs = {
+      0.002, 0.005, 0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.2, 0.35, 0.5,
+      0.75, 1., 1.5, 2., 3., 5., 7.5, 10., 15., 20., 30., 50., 75.,
+      100., 150., 200., 300.};
+  // Collect carriers at the depletion edge, not at the physical surface: the
+  // n+ above it is undepleted and conductive, so there is no drift field
+  // there and transporting through it is unphysical.
+  double depletionEdgeUm = 0.430466;
+
+  double staticSignalWindowNs = 4.;
+  // Must cover the last exported weighting-map time.
+  // The resistive tables run to 150 ns, by which point psi has relaxed to ~4e-4 of its prompt value, so the pad-charge cancellation is complete to that level.
+  // Covers the last weighting time (150 ns), by which psi has relaxed to
+  // ~1e-5 of prompt, so the pad-charge cancellation is complete.
+  double dynamicSignalWindowNs = 320.;
+  /* For runtime The delayed accumulation walks the bin index from
+    the current drift time all the way to (t + 150 ns) for EVERY drift segment of EVERY carrier (Sensor.cc:861), so cost is linear in
+    window/step. At 5 ps this is 30000 bins per segment and a 10-event run takes weeks. 50 ps still puts 10-20 samples across the ~0.5-1 ns prompt lobe. 
+    Refine only after the waveform shape is confirmed */
+  double signalStepNs = 0.05;
 
   std::string model = "okuto";
   double temperatureK = 300.0;
@@ -183,13 +302,14 @@ struct RunConfig {
 
   unsigned int siliconRegion = 0;
   bool assignAllRegionsToSilicon = false;  // diagnostic escape hatch only
-  double driftWindowNs = 4.; // must exceed the 4ns signal window
-  double fineStepNm = 75.; // step size inside the gain-layer band
-  double bulkStepNm = 250.;  // step size everywhere else
+  double driftWindowNs = 4.; // carrier-transport window; independent of signal window
+  double fineStepNm = 100.; // step size inside the gain-layer band
+  double bulkStepNm = 400.;  // step size everywhere else (see signalStepNs:
+                            // fewer segments is a linear runtime win)
   double fineBandHalfWidthUm = 2.5;  // band = [yGain-this, yGain+this]
   double activeFieldMinVcm = 100.;
 
-  bool spaceCharge = false;  // master switch for the Poisson correction
+  bool spaceCharge = true;  // master switch for the Poisson correction
   double scZExtentUm = 0.21;
   int scMaxIter = 16;
   double scRelaxation = 0.25;     // damps stochastic avalanche forcing
@@ -292,15 +412,21 @@ int main() {
                                      cfg.activeFieldMinVcm);
   if (!prof.valid) return 1;
   const double yTop = prof.yTop;
+  /* Carriers are collected at the depletion edge. 
+  Above it the n+ is undepleted and conductive, so there is no drift field there and
+  transporting through it is unphysical. 
+  Derived from the .sta electron density by aclgad_extract.py, not assumed */
+  const double yCollect = std::max(yTop + 0.02e-4,
+                                   cfg.depletionEdgeUm * 1.e-4);
   const double yBot = prof.yBot;
   const double d = prof.d;
   const double yGain = prof.yGain;
   const double eMax = prof.eMax;
 
-  // 2D search for a stronger field than the 1D probe line found. Seeded
-  // with the probe line's own peak (not 0) so the line's result is a
-  // valid answer if the grid search finds nothing better, and so the
-  // "e > globalMaxField" check below is correct from the first iteration.
+  /* 2D search for a stronger field than the 1D probe line found. Seeded
+  with the probe line's own peak (not 0) so the line's result is a
+  valid answer if the grid search finds nothing better, and so the
+  "e > globalMaxField" check below is correct from the first iteration. */
   double globalMaxField = eMax;
   double globalMaxX = x0;
   double globalMaxY = yGain;
@@ -371,15 +497,178 @@ int main() {
   // };
   if (!StripsInsideMap(strips, bx0, bx1)) return 1;
 
-  ComponentAnalyticField wcmp;
-  wcmp.AddPlaneY(yTop, 1., "top");
-  wcmp.AddPlaneY(yBot, 0., "back");
-  for (const auto& s : strips) {
-    const double xc = s.centerUm * 1.e-4, hw = s.halfWidthUm * 1.e-4;
-    wcmp.AddStripOnPlaneY('z', yTop, xc - hw, xc + hw, s.label);
+  ComponentAnalyticField analyticWeighting;
+  ComponentTcad2d dynamicWeighting;
+  // ComponentUser keys its weighting functions by label, so one instance
+  // covers every pad.
+  ComponentUser resistiveWeighting;
+  std::unique_ptr<mass::SheetWeighting> sheetModel;
+  Component* weightingCmp = nullptr;
+  // Empty unless the resistive-grid path is active, in which case it holds
+  // one component per strip, aligned with `strips`.
+  std::vector<Component*> perStripWeighting;
+  bool dynamicWeightingActive = false;
+
+  if (cfg.useDynamicTcadWeighting) {
+    if (cfg.weightingGridFile.empty() ||
+        cfg.weightingBiasDataFile.empty()) {
+      std::cerr << "Dynamic weighting requested, but weightingGridFile or "
+                   "weightingBiasDataFile is empty.\n";
+      return 3;
+    }
+    if (cfg.dynamicWeightingDataFiles.size() != strips.size()) {
+      std::cerr << "Dynamic weighting requires one time-slice file vector "
+                   "per readout strip.\n";
+      return 3;
+    }
+    if (!dynamicWeighting.Initialise(cfg.weightingGridFile,
+                                     cfg.weightingBiasDataFile)) {
+      std::cerr << "Could not initialise the TCAD weighting component.\n";
+      return 3;
+    }
+
+    for (std::size_t k = 0; k < strips.size(); ++k) {
+      if (cfg.dynamicWeightingDataFiles[k].size() !=
+          cfg.delayedSignalTimesNs.size()) {
+        std::cerr << "Dynamic weighting file count for " << strips[k].label
+                  << " does not match delayedSignalTimesNs.\n";
+        return 3;
+      }
+      for (std::size_t it = 0; it < cfg.delayedSignalTimesNs.size(); ++it) {
+        const double tNs = cfg.delayedSignalTimesNs[it];
+        const std::string& dataFile =
+            cfg.dynamicWeightingDataFiles[k][it];
+        const bool ok = cfg.dynamicWeightingUsesPotential
+            ? dynamicWeighting.SetDynamicWeightingPotential(
+                  cfg.weightingBiasDataFile, dataFile,
+                  cfg.weightingDeltaV, tNs, strips[k].label)
+            : dynamicWeighting.SetDynamicWeightingField(
+                  cfg.weightingBiasDataFile, dataFile,
+                  cfg.weightingDeltaV, tNs, strips[k].label);
+        if (!ok) {
+          std::cerr << "Failed to load dynamic weighting slice for "
+                    << strips[k].label << " at t=" << tNs
+                    << " ns from " << dataFile << "\n";
+          return 3;
+        }
+      }
+    }
+
+    // Probe a quarter of the way into the bulk from the collecting surface:
+    // deep enough to be well inside the drift region, shallow enough that the weighting potential is still appreciable.
+    const double wProbeY = yTop + 0.25 * (yBot - yTop);
+    const auto validation =
+        ValidateDelayedWeightingData(dynamicWeighting, strips, wProbeY);
+    if (!validation.available) {
+      std::cerr << "Dynamic weighting validation failed: "
+                << validation.message << "\n";
+      return 3;
+    }
+    weightingCmp = &dynamicWeighting;
+    dynamicWeightingActive = true;
+    std::cout << "dynamic TCAD weighting enabled with "
+              << validation.timesNs.size() << " time slices through "
+              << validation.timesNs.back() << " ns\n";
+  } else if (cfg.useResistiveGridWeighting) {
+    // Solve the resistive-sheet weighting problem in-process. No data files, no external tools: the bulk is a homogeneous slab with reflecting x
+    // boundaries, so its Dirichlet-to-Neumann map is diagonal in the cosine basis and the y dependence is analytic. See sheet_weighting.hh.
+    mass::SheetConfig sc;
+    sc.xMin = bx0;
+    sc.xMax = bx1;
+    sc.ySheet = cfg.depletionEdgeUm * 1.e-4;
+    sc.yBack = yBot;
+    sc.tOx = cfg.couplingOxideThicknessUm * 1.e-4;
+    sc.epsOx = cfg.couplingEpsR;
+    sc.rSheet = cfg.sheetResistanceOhmSq;
+    sc.dcX0 = cfg.dcContactX0Um * 1.e-4;
+    sc.dcX1 = cfg.dcContactX1Um * 1.e-4;
+    sc.nSheet = cfg.sheetNodes;
+    sc.nOutY = cfg.sheetOutY;
+    sc.stepsPerDecade = cfg.sheetStepsPerDecade;
+    sc.timesNs = cfg.resistiveWeightingTimesNs;
+    sc.pads.clear();
+    for (const auto& st : strips) {
+      sc.pads.emplace_back((st.centerUm - st.halfWidthUm) * 1.e-4,
+                           (st.centerUm + st.halfWidthUm) * 1.e-4);
+    }
+    std::cout << "solving resistive-sheet weighting: R_sq = " << sc.rSheet
+              << " ohm/sq, eps_ox = " << sc.epsOx << ", sheet at y = "
+              << cfg.depletionEdgeUm << " um, " << sc.nSheet << " nodes, "
+              << sc.timesNs.size() << " time slices\n";
+    sheetModel = std::make_unique<mass::SheetWeighting>(sc);
+    if (!sheetModel->SelfTest(std::cout)) {
+      std::cerr << "resistive-sheet self test FAILED\n";
+      return 3;
+    }
+
+    // One ComponentUser serves every electrode: unlike ComponentGrid it key its weighting functions by label 
+    // The captured model is immutable and read only so the lambdas are safe to share across OpenMP workers
+    const mass::SheetWeighting* model = sheetModel.get();
+    for (std::size_t k = 0; k < strips.size(); ++k) {
+      resistiveWeighting.SetWeightingPotential(
+          [model, k](const double x, const double y, const double) {
+            return model->Prompt(k, x, y);
+          },
+          strips[k].label);
+      resistiveWeighting.SetDelayedWeightingPotential(
+          [model, k](const double x, const double y, const double,
+                     const double t) {
+            return model->Delayed(k, x, y, t);
+          },
+          strips[k].label);
+    }
+    resistiveWeighting.SetDelayedSignalTimes(cfg.resistiveWeightingTimesNs);
+    weightingCmp = &resistiveWeighting;
+    dynamicWeightingActive = true;
+
+    const double wProbeY = yTop + 0.25 * (yBot - yTop);
+    const auto v =
+        ValidateDelayedWeightingData(resistiveWeighting, strips, wProbeY);
+    if (!v.available) {
+      std::cerr << "resistive weighting validation failed: " << v.message
+                << "\n";
+      return 3;
+    }
+    std::cout << "resistive-sheet AC-coupled weighting enabled: "
+              << v.timesNs.size() << " delayed slices through "
+              << v.timesNs.back() << " ns\n";
+  } else {
+    analyticWeighting.AddPlaneY(yTop, 1., "top");
+    analyticWeighting.AddPlaneY(yBot, 0., "back");
+    for (const auto& s : strips) {
+      const double xc = s.centerUm * 1.e-4;
+      const double hw = s.halfWidthUm * 1.e-4;
+      analyticWeighting.AddStripOnPlaneY(
+          'z', yTop, xc - hw, xc + hw, s.label);
+    }
+    weightingCmp = &analyticWeighting;
+    std::cout << "static analytic weighting enabled: prompt-only LGAD "
+                 "reference, not a dynamic AC-LGAD waveform\n";
   }
 
-  PrintWeightingSanity(wcmp, strips, yTop, yBot);
+  PrintWeightingSanity(*weightingCmp, strips, yTop, yBot);
+
+  const double signalWindowNs = dynamicWeightingActive
+      ? cfg.dynamicSignalWindowNs : cfg.staticSignalWindowNs;
+  if (cfg.signalStepNs <= 0. || signalWindowNs <= 0.) {
+    std::cerr << "Invalid signal time step or signal window.\n";
+    return 3;
+  }
+  const unsigned int signalBins = static_cast<unsigned int>(
+      std::ceil(signalWindowNs / cfg.signalStepNs));
+  // Compare against whichever weighting time array is actually in use the
+  // resistive path does not populate delayedSignalTimesNs, so checking that array alone would silently pass a too-short window.
+  const std::vector<double>& activeWeightingTimes =
+      cfg.useResistiveGridWeighting ? cfg.resistiveWeightingTimesNs
+                                    : cfg.delayedSignalTimesNs;
+  if (dynamicWeightingActive &&
+      !activeWeightingTimes.empty() &&
+      signalWindowNs + 1.e-12 < activeWeightingTimes.back()) {
+    std::cerr << "Dynamic signal window (" << signalWindowNs
+              << " ns) is shorter than the last weighting-map time ("
+              << activeWeightingTimes.back() << " ns).\n";
+    return 3;
+  }
 
   Sensor sensor;
   {
@@ -392,9 +681,19 @@ int main() {
       if (nullOut) oldCout = std::cout.rdbuf(nullOut.rdbuf());
     }
     sensor.AddComponent(&cmp);
-    for (const auto& s : strips) sensor.AddElectrode(&wcmp, s.label);
-    sensor.SetTimeWindow(0., 0.005, 800);
-    sensor.SetArea(bx0, yTop + 0.02e-4, -5.e-4, bx1, yBot, 5.e-4);
+    for (std::size_t k = 0; k < strips.size(); ++k) {
+      Component* wc = perStripWeighting.empty() ? weightingCmp
+                                                : perStripWeighting[k];
+      sensor.AddElectrode(wc, strips[k].label);
+    }
+    sensor.SetTimeWindow(0., cfg.signalStepNs, signalBins);
+    if (dynamicWeightingActive) {
+      sensor.EnableDelayedSignal();
+      sensor.SetDelayedSignalTimes(activeWeightingTimes);
+      sensor.SetDelayedSignalAveragingOrder(
+          cfg.delayedSignalAveragingOrder);
+    }
+    sensor.SetArea(bx0, yCollect, -5.e-4, bx1, yBot, 5.e-4);
     if (oldCout) {
       std::cout.flush();
       std::cout.rdbuf(oldCout);
@@ -404,7 +703,7 @@ int main() {
             << " electrodes (expect " << strips.size() << ")" << std::endl;
 
   if (cfg.doWeightingDump) {
-    DumpWeightingField(wcmp, strips, bx0, bx1, yTop, yBot,
+    DumpWeightingField(*weightingCmp, strips, bx0, bx1, yTop, yBot,
                        cfg.outDir + "wfield_full.txt");
   }
 
@@ -531,14 +830,21 @@ int main() {
   pc.yFineHiCm = yFineHi;
   pc.timeWindowNs = cfg.driftWindowNs;
   pc.sizeCap = sizeCap;
-  pc.xMin = bx0; pc.yMin = yTop + 0.02e-4; pc.zMin = -5.e-4;
+  pc.xMin = bx0; pc.yMin = yCollect; pc.zMin = -5.e-4;
   pc.xMax = bx1; pc.yMax = yBot;           pc.zMax = 5.e-4;
-  pc.tStart = 0.; pc.tStep = 0.005; pc.nBins = 800;
+  pc.tStart = 0.;
+  pc.tStep = cfg.signalStepNs;
+  pc.nBins = signalBins;
   pc.enableSignal = true;
   pc.ompDynamicChunk = std::max(1, cfg.avalancheOmpChunk);
   pc.forceSerial = cfg.mipForceSerialAvalanches;
-  pc.enableDelayedSignal = cfg.enableDelayedSignal;
-  pc.delayedSignalTimesNs = cfg.delayedSignalTimesNs;
+  pc.enableDelayedSignal = dynamicWeightingActive;
+  pc.requireDelayedWeightingData = true;
+  // Feed the array actually in use. In this Garfield build the value only reaches the truncation warning in RunAvalanchePass 
+  // Sensor stores its copy at Sensor.cc:758 and never reads it, all three accumulation loops taking cmp->DelayedSignalTimes(lbl) instead (Sensor.cc:838, 984, 1074)
+  // Passing the wrong array is therefore not a physics error here, but it would silence the one warning that catches a truncated slow lobe.
+  pc.delayedSignalTimesNs =
+      dynamicWeightingActive ? activeWeightingTimes : std::vector<double>{};
   pc.delayedSignalAveragingOrder = cfg.delayedSignalAveragingOrder;
   pc.silenceGarfieldSetupStdout = cfg.silenceGarfieldSensorSetup;
 
@@ -591,12 +897,15 @@ int main() {
 
   std::ofstream fEvents(eventsPath);
   fEvents << "event,bias,model,mode,nClusters,nPrimary,nTotal,countingGain,"
-             "chargeGain,peakOn,peakOff,intOn,intOff,scZExtentUm,"
+             "chargeGainPromptAbs,peakOn,peakOff,intOnSigned,intOffSigned,"
+             "areaOnPositive,areaOnNegative,areaOnAbsolute,"
+             "zeroCrossingOn_ns,scZExtentUm,"
              "scIterations,scConverged,scCharge_e_per_cm,scField_Vcm,"
              "elapsed_s";
   for (const auto& strip : strips) {
-    fEvents << "," << strip.label << "_qOn_arb," << strip.label
-            << "_qOff_arb," << strip.label << "_fractionOn";
+    fEvents << "," << strip.label << "_signedAreaOn_arbNs," << strip.label
+            << "_signedAreaOff_arbNs," << strip.label
+            << "_absoluteAreaFractionOn";
   }
   fEvents << "\n";
 
@@ -676,7 +985,30 @@ int main() {
          << "\nrngMode=continuousGarfieldStream"
          << "\nmipForceSerialAvalanches="
          << (cfg.mipForceSerialAvalanches ? 1 : 0)
-         << "\nenableDelayedSignal=" << (cfg.enableDelayedSignal ? 1 : 0)
+         << "\nuseResistiveGridWeighting="
+         << (cfg.useResistiveGridWeighting ? 1 : 0)
+         << "\nsheetResistanceOhmSq=" << cfg.sheetResistanceOhmSq
+         << "\ncouplingEpsR=" << cfg.couplingEpsR
+         << "\ncouplingOxideThicknessUm=" << cfg.couplingOxideThicknessUm
+         << "\nsheetNodes=" << cfg.sheetNodes
+         << "\nsheetTimeSlices=" << cfg.resistiveWeightingTimesNs.size()
+         << "\nsheetLastTimeNs=" << cfg.resistiveWeightingTimesNs.back()
+         << "\ndepletionEdgeUm=" << cfg.depletionEdgeUm
+         << "\nyCollectCm=" << yCollect
+         << "\nuseDynamicTcadWeighting="
+         << (cfg.useDynamicTcadWeighting ? 1 : 0)
+         << "\ndynamicWeightingActive="
+         << (dynamicWeightingActive ? 1 : 0)
+         << "\nweightingGridFile=" << cfg.weightingGridFile
+         << "\nweightingBiasDataFile=" << cfg.weightingBiasDataFile
+         << "\nweightingDeltaV=" << cfg.weightingDeltaV
+         << "\ndynamicWeightingUsesPotential="
+         << (cfg.dynamicWeightingUsesPotential ? 1 : 0)
+         << "\nsignalStepNs=" << cfg.signalStepNs
+         << "\nsignalWindowNs=" << signalWindowNs
+         << "\nsignalBins=" << signalBins
+         << "\nenableDelayedSignal="
+         << (dynamicWeightingActive ? 1 : 0)
          << "\ndelayedSignalAveragingOrder="
          << cfg.delayedSignalAveragingOrder
          << "\nmipFinalSampleCount=" << cfg.mipFinalSampleCount
@@ -711,7 +1043,11 @@ int main() {
     double countingGain = 0.;
     double chargeGain = 0.;
     SignalMetrics metrics;
+    SignalMetrics promptMetrics;
+    SignalMetrics delayedMetrics;
     std::vector<std::vector<double>> signal;
+    std::vector<std::vector<double>> promptSignal;
+    std::vector<std::vector<double>> delayedSignal;
     int scIterations = 0;
     bool scConverged = false;
     ScreeningFieldSample scSample;
@@ -729,14 +1065,18 @@ int main() {
             << "," << r.metrics.peak[r.metrics.peakStrip] << ","
             << offMetrics.peak[offMetrics.peakStrip] << ","
             << r.metrics.totalIntegral << "," << offMetrics.totalIntegral
+            << "," << r.metrics.totalPositiveArea
+            << "," << r.metrics.totalNegativeArea
+            << "," << r.metrics.totalAbsoluteArea
+            << "," << r.metrics.zeroCrossingAfterPeakNs[r.metrics.peakStrip]
             << "," << (std::string(mode) == "screened" ? cfg.scZExtentUm : 0.)
             << "," << r.scIterations << "," << (r.scConverged ? 1 : 0)
             << "," << r.scSample.depositedChargeEPerCm << ","
             << r.scSample.magnitudeVcm << "," << r.elapsedS;
     double qAbs = 0.;
-    for (const double q : r.metrics.integral) qAbs += std::abs(q);
+    for (const double q : r.metrics.absoluteArea) qAbs += q;
     for (std::size_t k = 0; k < strips.size(); ++k) {
-      const double frac = qAbs > 0. ? std::abs(r.metrics.integral[k]) / qAbs : 0.;
+      const double frac = qAbs > 0. ? r.metrics.absoluteArea[k] / qAbs : 0.;
       fEvents << "," << r.metrics.integral[k] << ","
               << offMetrics.integral[k] << "," << frac;
     }
@@ -779,15 +1119,26 @@ int main() {
 
     AvalanchePassConfig pcOff = pc;
     pcOff.multiplication = false;
+    // The gain-off pass is a prompt-normalisation baseline; it does not need
+    // the delayed AC response, and the delayed accumulation dominates runtime.
+    pcOff.enableDelayedSignal = false;
     std::vector<std::vector<double>> sigOff;
+    std::vector<std::vector<double>> sigOffPrompt;
+    std::vector<std::vector<double>> sigOffDelayed;
     const auto tGainOff = Clock::now();
-    RunAvalanchePass(cmp, wcmp, strips, primaries, pcOff, sigOff, nullptr,
-                     cfg.mipPairProgressEvery, "GAIN_OFF");
+    RunAvalanchePass(
+cmp, *weightingCmp, perStripWeighting, strips, primaries, pcOff, sigOff, nullptr,
+                     cfg.mipPairProgressEvery, "GAIN_OFF",
+                     nullptr, nullptr, nullptr, nullptr,
+                     &sigOffPrompt, &sigOffDelayed);
     const double gainOffS = ElapsedS(tGainOff);
     if (cfg.scPrintStageTimings) {
       std::cout << "  [timing] gain-off transport=" << gainOffS << " s\n";
     }
-    const SignalMetrics offMetrics = MeasureSignal(sigOff);
+    const SignalMetrics offMetrics =
+        MeasureSignal(sigOff, pc.tStart, pc.tStep);
+    const SignalMetrics offPromptMetrics =
+        MeasureSignal(sigOffPrompt, pc.tStart, pc.tStep);
     overlayEventIds.push_back(eventId);
     overlayPrimaryCounts.push_back(nPrimary);
     if (cfg.mipWriteOverlaySignals) {
@@ -827,16 +1178,21 @@ int main() {
       pcSample.enableSignal = cfg.mipFinalSampleEnableSignal;
       for (int is = 0; is < cfg.mipFinalSampleCount; ++is) {
         std::vector<std::vector<double>> sampleSignal;
+        std::vector<std::vector<double>> samplePrompt;
+        std::vector<std::vector<double>> sampleDelayed;
         const auto ts = Clock::now();
         const unsigned long nTotal = RunAvalanchePass(
-            cmp, wcmp, strips, primaries, pcSample, sampleSignal, nullptr,
-            0, std::string(mode) + "_SAMPLE", screeningField);
+cmp, *weightingCmp, perStripWeighting, strips, primaries, pcSample, sampleSignal, nullptr,
+            0, std::string(mode) + "_SAMPLE", screeningField,
+            nullptr, nullptr, nullptr, &samplePrompt, &sampleDelayed);
         const double gCount = double(nTotal) / nPrimary;
         double gCharge = std::numeric_limits<double>::quiet_NaN();
         if (cfg.mipFinalSampleEnableSignal) {
-          const auto metrics = MeasureSignal(sampleSignal);
-          if (std::abs(offMetrics.totalIntegral) > 0.) {
-            gCharge = metrics.totalIntegral / offMetrics.totalIntegral;
+          const auto promptMetrics =
+              MeasureSignal(samplePrompt, pc.tStart, pc.tStep);
+          if (offPromptMetrics.totalAbsoluteArea > 0.) {
+            gCharge = promptMetrics.totalAbsoluteArea /
+                      offPromptMetrics.totalAbsoluteArea;
           }
         }
         counting.push_back(gCount);
@@ -871,12 +1227,23 @@ int main() {
         pairPtr = &pairs;
       }
       staticResult.nTotal = RunAvalanchePass(
-          cmp, wcmp, strips, primaries, pcStatic, staticResult.signal, pairPtr,
-          cfg.mipPairProgressEvery, "STATIC");
-      staticResult.metrics = MeasureSignal(staticResult.signal);
+cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult.signal, pairPtr,
+          cfg.mipPairProgressEvery, "STATIC",
+          nullptr, nullptr, nullptr, nullptr,
+          &staticResult.promptSignal, &staticResult.delayedSignal);
+      staticResult.metrics =
+          MeasureSignal(staticResult.signal, pc.tStart, pc.tStep);
+      staticResult.promptMetrics =
+          MeasureSignal(staticResult.promptSignal, pc.tStart, pc.tStep);
+      staticResult.delayedMetrics =
+          MeasureSignal(staticResult.delayedSignal, pc.tStart, pc.tStep);
       staticResult.countingGain = double(staticResult.nTotal) / nPrimary;
-      staticResult.chargeGain = std::abs(offMetrics.totalIntegral) > 0.
-          ? staticResult.metrics.totalIntegral / offMetrics.totalIntegral : 0.;
+      // Use the prompt absolute area for the signal-based gain diagnostic.
+      // A fully captured AC-coupled total waveform has nearly cancelling
+      // signed lobes, so its signed integral is not a gain estimator.
+      staticResult.chargeGain = offPromptMetrics.totalAbsoluteArea > 0.
+          ? staticResult.promptMetrics.totalAbsoluteArea /
+            offPromptMetrics.totalAbsoluteArea : 0.;
       staticResult.elapsedS = ElapsedS(t0);
       if (cfg.mipWriteOverlaySignals) {
         for (std::size_t k = 0; k < strips.size(); ++k) {
@@ -972,7 +1339,7 @@ int main() {
 
         const auto tTransport = Clock::now();
         nIterTotal = RunAvalanchePass(
-            cmp, wcmp, strips, primaries, pcIter, sigIter, nullptr,
+cmp, *weightingCmp, perStripWeighting, strips, primaries, pcIter, sigIter, nullptr,
             cfg.mipPairProgressEvery, "SCREEN_ITER", &scField, nullptr,
             &scCfg, &fresh);
         const double transportS = ElapsedS(tTransport);
@@ -1075,10 +1442,15 @@ int main() {
       AvalanchePassConfig pcFinal = pc;
       pcFinal.multiplication = true;
       pcFinal.enableSignal = true;
-      if (!cfg.scFinalEvaluationPass && !cfg.mipWritePairFiles &&
+      if (!dynamicWeightingActive &&
+          !cfg.scFinalEvaluationPass && !cfg.mipWritePairFiles &&
           haveConvergedIterationSignal) {
         screenedResult.nTotal = convergedIterationTotal;
         screenedResult.signal = std::move(convergedIterationSignal);
+        // In the analytic prompt-only mode, total == prompt and delayed == 0.
+        screenedResult.promptSignal = screenedResult.signal;
+        screenedResult.delayedSignal.assign(
+            strips.size(), std::vector<double>(pc.nBins, 0.));
         if (cfg.scPrintStageTimings) {
           std::cout << "  [timing] reused converged-iteration signal; "
                        "skipped SCREEN_FINAL\n";
@@ -1094,8 +1466,10 @@ int main() {
         }
         const auto tFinal = Clock::now();
         screenedResult.nTotal = RunAvalanchePass(
-            cmp, wcmp, strips, primaries, pcFinal, screenedResult.signal,
-            pairPtr, cfg.mipPairProgressEvery, "SCREEN_FINAL", &scField);
+cmp, *weightingCmp, perStripWeighting, strips, primaries, pcFinal, screenedResult.signal,
+            pairPtr, cfg.mipPairProgressEvery, "SCREEN_FINAL",
+            &scField, nullptr, nullptr, nullptr,
+            &screenedResult.promptSignal, &screenedResult.delayedSignal);
         if (cfg.scPrintStageTimings) {
           std::cout << "  [timing] final screened transport="
                     << ElapsedS(tFinal) << " s\n";
@@ -1109,10 +1483,16 @@ int main() {
                                  cfg.scFinalFieldProfilePoints, fieldPath,
                                  cfg.scConsoleVerbosity >= 1);
       }
-      screenedResult.metrics = MeasureSignal(screenedResult.signal);
+      screenedResult.metrics =
+          MeasureSignal(screenedResult.signal, pc.tStart, pc.tStep);
+      screenedResult.promptMetrics =
+          MeasureSignal(screenedResult.promptSignal, pc.tStart, pc.tStep);
+      screenedResult.delayedMetrics =
+          MeasureSignal(screenedResult.delayedSignal, pc.tStart, pc.tStep);
       screenedResult.countingGain = double(screenedResult.nTotal) / nPrimary;
-      screenedResult.chargeGain = std::abs(offMetrics.totalIntegral) > 0.
-          ? screenedResult.metrics.totalIntegral / offMetrics.totalIntegral : 0.;
+      screenedResult.chargeGain = offPromptMetrics.totalAbsoluteArea > 0.
+          ? screenedResult.promptMetrics.totalAbsoluteArea /
+            offPromptMetrics.totalAbsoluteArea : 0.;
       screenedResult.elapsedS = ElapsedS(t0);
       if (cfg.mipWriteOverlaySignals) {
         for (std::size_t k = 0; k < strips.size(); ++k) {
@@ -1164,17 +1544,37 @@ int main() {
                        + EventTag(eventId) + ".csv");
       fs << "bin,t_ns";
       for (const auto& strip : strips) {
-        fs << "," << strip.label << "_GAIN_OFF";
-        if (staticResult.ran) fs << "," << strip.label << "_STATIC";
-        if (screenedResult.ran) fs << "," << strip.label << "_SCREENED";
+        fs << "," << strip.label << "_GAIN_OFF_TOTAL"
+           << "," << strip.label << "_GAIN_OFF_PROMPT"
+           << "," << strip.label << "_GAIN_OFF_DELAYED";
+        if (staticResult.ran) {
+          fs << "," << strip.label << "_STATIC_TOTAL"
+             << "," << strip.label << "_STATIC_PROMPT"
+             << "," << strip.label << "_STATIC_DELAYED";
+        }
+        if (screenedResult.ran) {
+          fs << "," << strip.label << "_SCREENED_TOTAL"
+             << "," << strip.label << "_SCREENED_PROMPT"
+             << "," << strip.label << "_SCREENED_DELAYED";
+        }
       }
       fs << "\n";
       for (unsigned int b = 0; b < pc.nBins; ++b) {
         fs << b << "," << (b + 0.5) * pc.tStep;
         for (std::size_t k = 0; k < strips.size(); ++k) {
-          fs << "," << sigOff[k][b];
-          if (staticResult.ran) fs << "," << staticResult.signal[k][b];
-          if (screenedResult.ran) fs << "," << screenedResult.signal[k][b];
+          fs << "," << sigOff[k][b]
+             << "," << sigOffPrompt[k][b]
+             << "," << sigOffDelayed[k][b];
+          if (staticResult.ran) {
+            fs << "," << staticResult.signal[k][b]
+               << "," << staticResult.promptSignal[k][b]
+               << "," << staticResult.delayedSignal[k][b];
+          }
+          if (screenedResult.ran) {
+            fs << "," << screenedResult.signal[k][b]
+               << "," << screenedResult.promptSignal[k][b]
+               << "," << screenedResult.delayedSignal[k][b];
+          }
         }
         fs << "\n";
       }
@@ -1237,11 +1637,11 @@ int main() {
     };
     writeStats("nPrimary", ensemblePrimaryCounts);
     writeStats("staticCountingGain", ensembleStaticCounting);
-    writeStats("staticChargeGain", ensembleStaticCharge);
+    writeStats("staticPromptAbsGain", ensembleStaticCharge);
     writeStats("screenedCountingGain", ensembleScreenedCounting);
-    writeStats("screenedChargeGain", ensembleScreenedCharge);
+    writeStats("screenedPromptAbsGain", ensembleScreenedCharge);
     writeStats("screenedOverStaticCounting", ensembleCountingRatio);
-    writeStats("screenedOverStaticCharge", ensembleChargeRatio);
+    writeStats("screenedOverStaticPromptAbs", ensembleChargeRatio);
   }
 
   std::cout << "wrote " << ensembleSummaryPath << "\n";
