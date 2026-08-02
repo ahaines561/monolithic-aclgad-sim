@@ -249,14 +249,20 @@ FieldDumpResult DumpElectricField(Component& cmp, double x0, double x1,
 -plus an overlap sanity check under strip0. Pure diagnostic printing. */
 void PrintWeightingSanity(Component& wcmp,
                           const std::vector<ReadoutStrip>& strips, double yTop,
-                          double yBot) {
+                          double yCollectHint, double yBot) {
+  /* yTop is the physical silicon surface, but in the AC-coupled model the
+    weighting potential only exists from the DEPLETION EDGE downwards: above
+    it the n+ is undepleted and conductive, so there is nothing to report and
+    a query there returns 0, which looks like a failure. Use the shallowest
+    point that is actually inside the drift region. */
+  const double yShallow = std::max(yTop + 0.01e-4, yCollectHint);
   for (const auto& s : strips) {
     const double xc = s.centerUm * 1.e-4, yMid = 0.5 * (yTop + yBot);
     double wx = 0., wy = 0., wz = 0.;
     wcmp.WeightingField(xc, yMid, 0., wx, wy, wz, s.label);
     std::cout << s.label << " (x=" << s.centerUm << " um): Ew at centre = ("
               << wx << ", " << wy << ", " << wz << "), wpot: top="
-              << wcmp.WeightingPotential(xc, yTop + 0.01e-4, 0., s.label)
+              << wcmp.WeightingPotential(xc, yShallow, 0., s.label)
               << " mid=" << wcmp.WeightingPotential(xc, yMid, 0., s.label)
               << " back="
               << wcmp.WeightingPotential(xc, yBot - 0.01e-4, 0., s.label)
@@ -268,11 +274,16 @@ void PrintWeightingSanity(Component& wcmp,
   double sumAtFirst = 0.;
   for (const auto& s : strips) {
     sumAtFirst += wcmp.WeightingPotential(strips[0].centerUm * 1.e-4,
-                                          yTop + 0.01e-4, 0., s.label);
+                                          yShallow, 0., s.label);
   }
-  std::cout << "sum of weighting potentials at yTop under "
-            << strips[0].label << "'s centre (sanity: strips shouldn't "
-            << "overlap) = " << sumAtFirst << "  [expect ~1]" << std::endl;
+  /* For DC-coupled strips tiling a continuous grounded plane this sum is 1
+    by completeness. For AC-coupled pads it is the local capacitive divider
+    C_ox/(C_ox + C_bulk) ~ 0.99; the remainder belongs to the DC contact and
+    the backplane, which are separate electrodes. True completeness over ALL
+    electrodes is what the sheet solver self-test checks. */
+  std::cout << "sum of weighting potentials at y=" << yShallow * 1.e4
+            << " um under " << strips[0].label << "'s centre = " << sumAtFirst
+            << "  [expect ~1 DC-coupled, ~0.99 AC-coupled]" << std::endl;
 }
 
 /* Avalanche Stepping
@@ -1467,4 +1478,3 @@ void ApplyRelaxedCharge(ComponentPoisson2d& sc, ChargeGrid& mixed,
   }
   LoadChargeGrid(sc, mixed);
 }
-

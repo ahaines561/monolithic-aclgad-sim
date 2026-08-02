@@ -184,7 +184,8 @@ struct RunConfig {
                         // "lgad150V.sta";
                         // "lgad180V.sta";
                         // "lgad190V.sta";
-                        "aclgad.sta";
+                        // "aclgad.sta";
+                        "aclgad230V.sta";
   std::string outDir = "output_files_aclgad/";
 
   double biasVOverride = std::numeric_limits<double>::quiet_NaN();
@@ -199,7 +200,7 @@ struct RunConfig {
   // nSegments x nTimeBins per electrode (Sensor.cc:844-874), which is orders
   // of magnitude more than a prompt-only run. Validate the waveform on a few
   // events, then scale up.
-  int nMips = 2;
+  int nMips = 4;
   int mipEventOffset = 0;
   bool mipRunStatic = true;
   bool mipRunScreened = false;
@@ -253,8 +254,8 @@ struct RunConfig {
     R_sq = 1/(q N_s mu_n) = 2740 ohm/sq at mu_n = 300 cm2/Vs.
     mu = 250 -> 3290,  mu = 300 -> 2740,  mu = 350 -> 2350 ohm/sq. */
   double sheetResistanceOhmSq = 2740.;
-  // 3.9 = SiO2, 7.5 = Si3N4. UNVERIFIED from the .sta -- every time constant
-  // scales with this.
+  /* CONFIRMED silicon dioxide (2026-08-01). Every sheet time constant scales
+    linearly with this, so it is no longer a systematic. */
   double couplingEpsR = 3.9;
   double couplingOxideThicknessUm = 0.1;
   // Grounded DC contact on the n+ (the `bulk` electrode in the .sta).
@@ -263,10 +264,32 @@ struct RunConfig {
   std::size_t sheetNodes = 301;
   std::size_t sheetOutY = 81;
   std::size_t sheetStepsPerDecade = 60;
+  /* DELAYED WEIGHTING TIME GRID.
+
+    HARD CONSTRAINT: consecutive entries must be at least signalStepNs apart.
+    Sensor.cc:859-868 distributes each delayed increment across the signal
+    bins it spans using weights f = (t1 - t0)/dt, but t1 is initialised to the
+    BIN BOUNDARY and is only clamped to the actual end time on later loop
+    iterations. When two consecutive delayed times fall in the SAME signal
+    bin the loop executes once with f > 1 and the charge is over-counted:
+    for slices at 0.002 and 0.005 ns with a 0.2 ns bin, f = 66.
+    This inflates both lobes and wrecks the charge cancellation -- it is what
+    took net/|Q-| from ~0.5% to ~4%.
+
+    Cost is nSegments x nElectrodes x (t_max / signalStepNs) and is INDEPENDENT
+    of the number of slices, so pack them as densely as the constraint allows.
+
+    Delayed() interpolates linearly from 0 up to the first slice, so the
+    sub-100 ps sheet equalisation is still represented, just not resolved --
+    which a 0.2 ns signal bin could not do in any case.
+
+    Last time = 150 ns. Delayed() clamps beyond the final slice, so cutting
+    early freezes a fraction of psi permanently. psi(t)/psi(0+) at mid-bulk
+    with R_sq = 2740: 100 ns -> 1.6e-2, 150 ns -> 2.4e-3, 300 ns -> <1e-5. */
   std::vector<double> resistiveWeightingTimesNs = {
-      0.002, 0.005, 0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.2, 0.35, 0.5,
-      0.75, 1., 1.5, 2., 3., 5., 7.5, 10., 15., 20., 30., 50., 75.,
-      100., 150., 200., 300.};
+      0.2, 0.4, 0.6, 0.8, 1.0, 1.4, 1.8, 2.2, 2.6, 3.0, 4.0, 5.0, 6.0,
+      7.0, 8.5, 10., 12., 14., 17., 20., 25., 30., 40., 50., 65., 80.,
+      100., 125., 150.};
   // Collect carriers at the depletion edge, not at the physical surface: the
   // n+ above it is undepleted and conductive, so there is no drift field
   // there and transporting through it is unphysical.
@@ -275,14 +298,17 @@ struct RunConfig {
   double staticSignalWindowNs = 4.;
   // Must cover the last exported weighting-map time.
   // The resistive tables run to 150 ns, by which point psi has relaxed to ~4e-4 of its prompt value, so the pad-charge cancellation is complete to that level.
-  // Covers the last weighting time (150 ns), by which psi has relaxed to
-  // ~1e-5 of prompt, so the pad-charge cancellation is complete.
-  double dynamicSignalWindowNs = 320.;
-  /* For runtime The delayed accumulation walks the bin index from
-    the current drift time all the way to (t + 150 ns) for EVERY drift segment of EVERY carrier (Sensor.cc:861), so cost is linear in
-    window/step. At 5 ps this is 30000 bins per segment and a 10-event run takes weeks. 50 ps still puts 10-20 samples across the ~0.5-1 ns prompt lobe. 
-    Refine only after the waveform shape is confirmed */
-  double signalStepNs = 0.05;
+  /* Only needs to exceed the last weighting time plus the carrier drift
+    time. This does NOT drive the delayed cost -- the weighting range does. */
+  double dynamicSignalWindowNs = 200.;
+  /* CRITICAL FOR RUNTIME. The delayed accumulation walks the bin index from
+    the current drift time out to (t + t_max_delayed) for EVERY drift segment
+    of EVERY carrier (Sensor.cc:850-872), so cost is linear in 1/signalStepNs.
+    The prompt lobe peaks near 0.7 ns and crosses zero near 1.2 ns, so 0.2 ns
+    still gives ~4 samples to the peak. Comparing observables against the
+    0.05 ns run IS the temporal convergence test (validation item V7);
+    refine again only if they disagree. */
+  double signalStepNs = 0.2;
 
   std::string model = "okuto";
   double temperatureK = 300.0;
@@ -304,8 +330,10 @@ struct RunConfig {
   bool assignAllRegionsToSilicon = false;  // diagnostic escape hatch only
   double driftWindowNs = 4.; // carrier-transport window; independent of signal window
   double fineStepNm = 100.; // step size inside the gain-layer band
-  double bulkStepNm = 400.;  // step size everywhere else (see signalStepNs:
-                            // fewer segments is a linear runtime win)
+  double bulkStepNm = 800.;  /* step size everywhere else. Delayed cost is
+                             linear in the segment count and the bulk field is
+                             smooth, so a coarse step here is cheap accuracy.
+                             The fine step near the gain layer is unchanged. */
   double fineBandHalfWidthUm = 2.5;  // band = [yGain-this, yGain+this]
   double activeFieldMinVcm = 100.;
 
@@ -617,6 +645,27 @@ int main() {
           },
           strips[k].label);
     }
+    /* Enforce the Sensor.cc:859-868 spacing constraint before it can bite:
+      two delayed times inside one signal bin over-count the charge. */
+    {
+      const auto& wt = cfg.resistiveWeightingTimesNs;
+      if (wt.empty() || wt.front() < cfg.signalStepNs - 1.e-12) {
+        std::cerr << "Delayed weighting grid must start at or after "
+                     "signalStepNs (" << cfg.signalStepNs << " ns); first "
+                     "slice is " << (wt.empty() ? 0. : wt.front()) << " ns.\n";
+        return 3;
+      }
+      for (std::size_t i = 1; i < wt.size(); ++i) {
+        if (wt[i] - wt[i - 1] < cfg.signalStepNs - 1.e-12) {
+          std::cerr << "Delayed weighting times " << wt[i - 1] << " and "
+                    << wt[i] << " ns are closer than one signal bin ("
+                    << cfg.signalStepNs << " ns). Sensor would over-count the "
+                       "delayed charge. Widen the spacing or reduce "
+                       "signalStepNs.\n";
+          return 3;
+        }
+      }
+    }
     resistiveWeighting.SetDelayedSignalTimes(cfg.resistiveWeightingTimesNs);
     weightingCmp = &resistiveWeighting;
     dynamicWeightingActive = true;
@@ -646,7 +695,7 @@ int main() {
                  "reference, not a dynamic AC-LGAD waveform\n";
   }
 
-  PrintWeightingSanity(*weightingCmp, strips, yTop, yBot);
+  PrintWeightingSanity(*weightingCmp, strips, yTop, yCollect, yBot);
 
   const double signalWindowNs = dynamicWeightingActive
       ? cfg.dynamicSignalWindowNs : cfg.staticSignalWindowNs;

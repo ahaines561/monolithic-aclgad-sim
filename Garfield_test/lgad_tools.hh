@@ -336,7 +336,7 @@ void ConfigureAvalanche(Garfield::AvalancheMC& av, double& stepCm,
 -plus an overlap sanity check under strip0. Pure diagnostic printing. */
 void PrintWeightingSanity(Garfield::Component& wcmp,
                           const std::vector<ReadoutStrip>& strips, double yTop,
-                          double yBot);
+                          double yCollectHint, double yBot);
 
 // per-strip weighting potential over a grid, to a text file:
 // x_um,y_um,<label>_phi,...
