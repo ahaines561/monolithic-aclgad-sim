@@ -10,8 +10,9 @@
 //   bulk :  Laplace(phi) = 0        on 0 <= y <= d   (depleted, uniform eps)
 //   sheet:  d(sigma)/dt = (1/R_sq) d2u/dx2           at y = 0
 //
-// where u(x, t) is the potential of the undepleted n+ and sigma its free
-// surface charge density,
+// This is generally called a Robin boundary condition, 
+// or a mixed boundary condition where u(x, t) is the potential of the undepleted n+,
+// and sigma its free surface charge density
 //
 //   sigma = eps_Si * (DtN u)  +  C_ox(x) * (u - V_pad(x)).
 //

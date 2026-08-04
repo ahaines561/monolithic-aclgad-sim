@@ -389,6 +389,74 @@ void DumpWeightingField(Component& wcmp,
             << " s" << std::endl;
 }
 
+void DumpDynamicWeighting(Component& wcmp,
+                          const std::vector<ReadoutStrip>& strips,
+                          const double bx0, const double bx1, const double yLo,
+                          const double yHi, const std::vector<double>& timesNs,
+                          const std::string& outPrefix, const int nx,
+                          const int ny) {
+  const auto tStart = Clock::now();
+  // Probe point: mid-depth under the first strip, for the summary trace.
+  const double xProbe = strips.empty() ? 0.5 * (bx0 + bx1)
+                                       : strips.front().centerUm * 1.e-4;
+  const double yProbe = 0.5 * (yLo + yHi);
+
+  std::ofstream fs(outPrefix + "_summary.csv");
+  fs << "t_ns";
+  for (const auto& s : strips) fs << "," << s.label << "_maxAbsPsi";
+  for (const auto& s : strips) fs << "," << s.label << "_psiProbe";
+  fs << "\n";
+
+  // Index -1 denotes the prompt map; >= 0 indexes timesNs.
+  for (int it = -1; it < static_cast<int>(timesNs.size()); ++it) {
+    const double t = it < 0 ? 0. : timesNs[it];
+    std::ostringstream fn;
+    fn << outPrefix << "_t" << std::setfill('0') << std::setw(3) << (it + 1)
+       << "_" << std::fixed << std::setprecision(3) << t << "ns.csv";
+    std::ofstream fw(fn.str());
+    fw << "x_um,y_um";
+    for (const auto& s : strips) fw << "," << s.label << "_psi";
+    fw << "\n";
+
+    std::vector<double> maxAbs(strips.size(), 0.), probe(strips.size(), 0.);
+    for (int ix = 0; ix <= nx; ++ix) {
+      const double x = bx0 + (bx1 - bx0) * ix / nx;
+      for (int iy = 0; iy <= ny; ++iy) {
+        const double y = yLo + (yHi - yLo) * iy / ny;
+        fw << x * 1.e4 << "," << y * 1.e4;
+        for (std::size_t k = 0; k < strips.size(); ++k) {
+          // Prompt plus delayed remainder = the potential the signal sees.
+          double psi = wcmp.WeightingPotential(x, y, 0., strips[k].label);
+          if (it >= 0) {
+            psi += wcmp.DelayedWeightingPotential(x, y, 0., t,
+                                                  strips[k].label);
+          }
+          if (!std::isfinite(psi)) psi = 0.;
+          fw << "," << psi;
+          maxAbs[k] = std::max(maxAbs[k], std::abs(psi));
+        }
+        fw << "\n";
+      }
+    }
+    for (std::size_t k = 0; k < strips.size(); ++k) {
+      double psi = wcmp.WeightingPotential(xProbe, yProbe, 0.,
+                                           strips[k].label);
+      if (it >= 0) {
+        psi += wcmp.DelayedWeightingPotential(xProbe, yProbe, 0., t,
+                                              strips[k].label);
+      }
+      probe[k] = std::isfinite(psi) ? psi : 0.;
+    }
+    fs << t;
+    for (double v : maxAbs) fs << "," << v;
+    for (double v : probe) fs << "," << v;
+    fs << "\n";
+  }
+  std::cout << "  dynamic weighting dumped: " << (timesNs.size() + 1)
+            << " time slices -> " << outPrefix << "_t*.csv  ("
+            << ElapsedS(tStart) << " s)" << std::endl;
+}
+
 DelayedWeightingValidation ValidateDelayedWeightingData(
     Component& weightingCmp, const std::vector<ReadoutStrip>& strips,
     const double probeYCm) {
@@ -533,7 +601,9 @@ unsigned long RunAvalanchePass(
     const SpaceChargeConfig* scCfg,
     ChargeGrid* scGrid,
     std::vector<std::vector<double>>* promptSignalOut,
-    std::vector<std::vector<double>>* delayedSignalOut) {
+    std::vector<std::vector<double>>* delayedSignalOut,
+    TransverseExtentAccumulator* lzAcc, const double lzBandLoCm,
+    const double lzBandHiCm) {
   const std::size_t nStrips = strips.size();
   bool useDelayedSignal = false;
   if (pc.enableSignal && pc.enableDelayedSignal) {
@@ -665,7 +735,9 @@ unsigned long RunAvalanchePass(
     localAval.EnableMultiplication(pc.multiplication);
     // drift paths are stored only when we need them to deposit space
     // charge; they cost memory, so they stay off otherwise
-    if ((scDeposit || scGrid) && scCfg) localAval.EnableDriftLines(true);
+    if (((scDeposit || scGrid) && scCfg) || lzAcc) {
+      localAval.EnableDriftLines(true);
+    }
 
     // per-thread CSV buffer: writing inside the loop would take a lock on
     // every single pair, serialising all threads
@@ -676,6 +748,10 @@ unsigned long RunAvalanchePass(
        summed under one critical section at the end instead. */
     ChargeGrid localGrid;
     if (scGrid && scCfg) { localGrid = *scGrid; localGrid.Clear(); }
+    // Private accumulator per thread; merged under the critical section
+    // below. The sums are order-independent, so the result is deterministic
+    // apart from floating-point association.
+    TransverseExtentAccumulator localLz;
 
     #pragma omp for schedule(dynamic, pc.ompDynamicChunk) reduction(+ : nTotal)
     for (long long i = 0; i < nPrim; ++i) {
@@ -688,6 +764,9 @@ unsigned long RunAvalanchePass(
       }
       if (scGrid && scCfg) {
         DepositAvalancheIntoGrid(localAval, localGrid, *scCfg);
+      }
+      if (lzAcc) {
+        localLz.Add(localAval, lzBandLoCm, lzBandHiCm);
       }
       std::size_t ne = 0, ni = 0;
       localAval.GetAvalancheSize(ne, ni);
@@ -714,6 +793,7 @@ unsigned long RunAvalanchePass(
     #pragma omp critical
     {
       if (pairsCsv) *pairsCsv << localRows.str();
+      if (lzAcc) lzAcc->Merge(localLz);
       if (scGrid && scCfg) {
         for (std::size_t i = 0; i < scGrid->rho.size(); ++i) {
           scGrid->rho[i] += localGrid.rho[i];
@@ -1225,6 +1305,74 @@ std::size_t DepositAvalancheCharge(const AvalancheMC& aval,
               << std::endl;
   }
   return nOutside;
+}
+
+// --------------------------------------------------------------------
+// Transport-derived L_z.
+// --------------------------------------------------------------------
+void TransverseExtentAccumulator::Add(const AvalancheMC& aval,
+                                      const double yLoCm, const double yHiCm,
+                                      const bool useElectrons,
+                                      const bool useHoles) {
+  const bool bandAll = !(yHiCm > yLoCm);
+
+  auto walk = [&](const std::vector<AvalancheMC::EndPoint>& eps) {
+    for (const auto& ep : eps) {
+      if (ep.path.size() < 2) { ++nCarriersNoPath; continue; }
+      const double w = static_cast<double>(ep.weight);
+      for (std::size_t k = 0; k + 1 < ep.path.size(); ++k) {
+        const auto& p0 = ep.path[k];
+        const auto& p1 = ep.path[k + 1];
+        const double dt = p1.t - p0.t;      // ns in this segment
+        if (dt <= 0.) continue;
+        const double ym = 0.5 * (p0.y + p1.y);
+        if (!bandAll && (ym < yLoCm || ym > yHiCm)) continue;
+        // Midpoint, matching how DepositAvalancheCharge places charge.
+        const double zm = 0.5 * (p0.z + p1.z);
+        const double wdt = w * dt;
+        sumW += wdt;
+        sumWz += wdt * zm;
+        sumWz2 += wdt * zm * zm;
+        ++nSegments;
+      }
+    }
+  };
+  if (useElectrons) walk(aval.GetElectrons());
+  if (useHoles) walk(aval.GetHoles());
+}
+
+void TransverseExtentAccumulator::Merge(const TransverseExtentAccumulator& o) {
+  sumW += o.sumW;
+  sumWz += o.sumWz;
+  sumWz2 += o.sumWz2;
+  nSegments += o.nSegments;
+  nCarriersNoPath += o.nCarriersNoPath;
+}
+
+TransverseExtent TransverseExtentAccumulator::Finish() const {
+  TransverseExtent r;
+  r.nSegments = nSegments;
+  r.nCarriersNoPath = nCarriersNoPath;
+  r.weightNsE = sumW;
+  if (sumW <= 0. || nSegments < 2) return r;   // valid stays false
+  r.zBarCm = sumWz / sumW;
+  // Var = <z^2> - <z>^2. Clamp: catastrophic cancellation can make this
+  // very slightly negative when the spread is far below the mean offset.
+  const double var = std::max(0., sumWz2 / sumW - r.zBarCm * r.zBarCm);
+  r.sigmaZCm = std::sqrt(var);
+  r.lzCm = std::sqrt(12.) * r.sigmaZCm;
+  r.valid = r.lzCm > 0.;
+  return r;
+}
+
+TransverseExtent MeasureTransverseExtent(const AvalancheMC& aval,
+                                         const double yLoCm,
+                                         const double yHiCm,
+                                         const bool useElectrons,
+                                         const bool useHoles) {
+  TransverseExtentAccumulator acc;
+  acc.Add(aval, yLoCm, yHiCm, useElectrons, useHoles);
+  return acc.Finish();
 }
 
 ScreeningFieldSample SampleScreeningField(

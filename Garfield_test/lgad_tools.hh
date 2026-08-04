@@ -152,6 +152,62 @@ bool SetupSpaceCharge(Garfield::ComponentPoisson2d& sc,
                       const SpaceChargeConfig& cfg,
                       Garfield::Medium* medium);
 
+/* ---------------------------------------------------------------------
+   Transport-derived effective out-of-plane extent L_z.
+
+   ComponentPoisson2d is a 2D solver: it wants charge per unit length in the
+   unresolved z direction, so the avalanche charge must be divided by some
+   effective transverse width. That width was previously the hand-set
+   constant scZExtentUm = 0.21 um, chosen because it reproduced the gain
+   suppression seen in Silvaco -- i.e. it was fitted to the very observable
+   the screening model is supposed to predict.
+
+   This measures it instead. Garfield transports in full 3D even when the
+   FIELD is z-invariant, so Point::z carries the real transverse spread
+   accumulated by diffusion. Weighting by residence time w_j * dt_j gives the
+   time-averaged transverse charge distribution actually seen by Poisson's
+   equation, rather than a snapshot or an endpoint tally:
+
+     zbar     = sum_j w_j dt_j z_j / sum_j w_j dt_j
+     sigma_z^2= sum_j w_j dt_j (z_j - zbar)^2 / sum_j w_j dt_j
+
+   A uniform slab with the same RMS width has full width sqrt(12)*sigma_z,
+   which is the number ComponentPoisson2d should be handed.
+
+   yLoCm/yHiCm restrict the sum to a band in depth. Screening only matters
+   where the carrier density is high and the field is critical, so the
+   physically meaningful L_z is the one measured ACROSS THE GAIN LAYER, not
+   averaged over the whole 50 um bulk where late holes have diffused far. */
+struct TransverseExtent {
+  double zBarCm = 0.;
+  double sigmaZCm = 0.;
+  double lzCm = 0.;          // sqrt(12) * sigmaZ
+  double weightNsE = 0.;     // total sum of w_j dt_j (carrier-ns)
+  std::size_t nSegments = 0;
+  std::size_t nCarriersNoPath = 0;
+  bool valid = false;
+};
+
+/* Residence-time-weighted transverse spread of one avalanche.
+   REQUIRES aval.EnableDriftLines(true). Pass yLoCm >= yHiCm to use all
+   depths. Electrons and holes are combined by default because both
+   contribute to the screening charge density. */
+TransverseExtent MeasureTransverseExtent(const Garfield::AvalancheMC& aval,
+                                         double yLoCm = 0., double yHiCm = 0.,
+                                         bool useElectrons = true,
+                                         bool useHoles = true);
+
+/* Same, but accumulated across many avalanches (one MIP = many primaries).
+   Merge with Add() then call Finish(). */
+struct TransverseExtentAccumulator {
+  double sumW = 0., sumWz = 0., sumWz2 = 0.;
+  std::size_t nSegments = 0, nCarriersNoPath = 0;
+  void Add(const Garfield::AvalancheMC& aval, double yLoCm = 0.,
+           double yHiCm = 0., bool useElectrons = true, bool useHoles = true);
+  void Merge(const TransverseExtentAccumulator& o);
+  TransverseExtent Finish() const;
+};
+
 /* Deposit one avalanche's carriers, weighted by residence time.
    Electrons negative, holes positive; their separation is what opposes
    the gain-layer field. Does NOT call Solve() -- the caller does that
@@ -346,6 +402,26 @@ void DumpWeightingField(Garfield::Component& wcmp,
                         const std::string& outPath, int nx = 250,
                         int ny = 150);
 
+/* Time-resolved dump of the FULL weighting potential
+     psi_k(x, y, t) = prompt_k(x, y) + delayed_k(x, y, t)
+   on a regular grid, one file per requested time. This is the quantity the
+   signal calculation actually uses, so it is what you want to inspect when a
+   waveform looks wrong.
+
+   Writes <prefix>_t<index>_<time>ns.csv with columns
+     x_um, y_um, <label>_psi, ...
+   plus a <prefix>_summary.csv giving, per time and per electrode, the maximum
+   |psi| and the value at a probe point -- enough to see the relaxation without
+   opening every grid file.
+
+   Passing an empty timesNs dumps only the prompt map (t = 0+). */
+void DumpDynamicWeighting(Garfield::Component& wcmp,
+                          const std::vector<ReadoutStrip>& strips, double bx0,
+                          double bx1, double yLo, double yHi,
+                          const std::vector<double>& timesNs,
+                          const std::string& outPrefix, int nx = 200,
+                          int ny = 120);
+
 struct DelayedWeightingValidation {
   bool available = false;
   std::vector<double> timesNs;
@@ -451,7 +527,15 @@ unsigned long RunAvalanchePass(
        enableDelayedSignal=true and the weighting component supplies a
        dynamic weighting potential or field. */
     std::vector<std::vector<double>>* promptSignalOut = nullptr,
-    std::vector<std::vector<double>>* delayedSignalOut = nullptr);
+    std::vector<std::vector<double>>* delayedSignalOut = nullptr,
+    /* If non-null, the residence-time-weighted transverse spread of every
+       transported carrier is accumulated here, giving a measured L_z instead
+       of the hand-set scZExtentUm. Forces drift-line storage on, which costs
+       memory, so leave it null when not measuring. lzBandLoCm/HiCm restrict
+       the sum to a depth band (pass equal values for all depths); the
+       physically relevant band is the gain layer. */
+    TransverseExtentAccumulator* lzAcc = nullptr,
+    double lzBandLoCm = 0., double lzBandHiCm = 0.);
 
 /* convergence scan
 G_e/G_eh vs step size at a fixed injection point; avalLadder must

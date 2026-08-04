@@ -16,7 +16,7 @@ int main(int argc, char* argv[]) {
 
   const std::string file =
       argc > 1 ? argv[1]
-               : "/home/ahaines561/HEP/MAS/Silvaco_dat/lgad150V.sta";
+               : "/home/ahaines561/HEP/MAS/Silvaco_dat/aclgad300V.sta";
 
   ComponentTcad2d cmp;
   if (!cmp.InitialiseSilvaco(file)) {

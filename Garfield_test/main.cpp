@@ -184,16 +184,29 @@ struct RunConfig {
                         // "lgad150V.sta";
                         // "lgad180V.sta";
                         // "lgad190V.sta";
-                        // "aclgad.sta";
-                        "aclgad230V.sta";
+                        // "aclgad230V.sta";
+                          "aclgad300V.sta";
   std::string outDir = "output_files_aclgad/";
 
   double biasVOverride = std::numeric_limits<double>::quiet_NaN();
   double xTrackUm = 250.;  // MIP track position
-  bool doWeightingDump = false; // DumpWeightingField
-  bool doConvergenceScan = false;  // legacy G_e/G_eh step ladder
-  bool doFeedbackScan = false;     // explicit e_no_holes/e_full/h_full/eh_full
-  bool doModelComparison = false;  // deprecated alias for doFeedbackScan
+
+  // Position Scan
+  bool doPositionScan = true;
+  double scanXStartUm = 0.;
+  double scanXEndUm = 500.;
+  double scanXStepUm = 20.;
+  int scanMipsPerPoint = 3;
+  bool scanUseGain = false;
+  bool doWeightingDump = false;
+  /* Time-resolved dump of psi_k(x,y,t) for the resistive-sheet model, one grid
+    file per delayed time slice plus a summary trace. Cheap (seconds) and
+    independent of the MIP loop; use it to inspect the relaxation directly
+    rather than inferring it from waveforms. */
+  bool doDynamicWeightingDump = false; // dump the W(x,t) maps for all strips, one file per time slice
+  bool doConvergenceScan = false; // legacy G_e/G_eh step ladder
+  bool doFeedbackScan = false; // explicit e_no_holes/e_full/h_full/eh_full
+  bool doModelComparison = false; // deprecated alias for doFeedbackScan
   bool doMIP = true;
 
   // Start small: the delayed-signal calculation costs roughly
@@ -201,6 +214,23 @@ struct RunConfig {
   // of magnitude more than a prompt-only run. Validate the waveform on a few
   // events, then scale up.
   int nMips = 4;
+
+  /* Measured L_z from MIP throws. This is the effective out-of-plane extent of the avalanche charge cloud.
+    ComponentPoisson2d needs charge per unit length in the unresolved z
+    direction, which until now was the hand-set scZExtentUm = 0.21 um;
+    chosen because it reproduced Silvaco's gain suppression, i.e. fitted to
+    the observable the screening model is meant to predict.
+    Garfield transports in full 3D even though the field is z-invariant, so
+    the real transverse spread is already in Point::z. This measures the
+    residence-time-weighted sigma_z and reports L_z = sqrt(12)*sigma_z.
+    Costs drift-line storage (memory), so it is opt-in. */
+  bool measureLz = true;
+  /* Restrict the measurement to a band around the gain layer. Screening only
+    matters where the carrier density is high AND the field is critical;
+    averaging over the whole 50 um bulk would be dominated by late holes that
+    have diffused far and contribute nothing to gain suppression.
+    Set both to 0 to use all depths (reported alongside, for comparison). */
+  double lzBandHalfWidthUm = 2.5;
   int mipEventOffset = 0;
   bool mipRunStatic = true;
   bool mipRunScreened = false;
@@ -253,7 +283,7 @@ struct RunConfig {
   Derived from aclgad.sta: N_s = 7.58e12 cm^-2 of MOBILE electrons over the undepleted n+ (0 -> 0.43 um), uniform to ~1% across the active area, so
     R_sq = 1/(q N_s mu_n) = 2740 ohm/sq at mu_n = 300 cm2/Vs.
     mu = 250 -> 3290,  mu = 300 -> 2740,  mu = 350 -> 2350 ohm/sq. */
-  double sheetResistanceOhmSq = 2740.;
+  double sheetResistanceOhmSq = 1500.;
   /* CONFIRMED silicon dioxide (2026-08-01). Every sheet time constant scales
     linearly with this, so it is no longer a systematic. */
   double couplingEpsR = 3.9;
@@ -308,7 +338,7 @@ struct RunConfig {
     still gives ~4 samples to the peak. Comparing observables against the
     0.05 ns run IS the temporal convergence test (validation item V7);
     refine again only if they disagree. */
-  double signalStepNs = 0.2;
+  double signalStepNs = 0.05;
 
   std::string model = "okuto";
   double temperatureK = 300.0;
@@ -329,7 +359,7 @@ struct RunConfig {
   unsigned int siliconRegion = 0;
   bool assignAllRegionsToSilicon = false;  // diagnostic escape hatch only
   double driftWindowNs = 4.; // carrier-transport window; independent of signal window
-  double fineStepNm = 100.; // step size inside the gain-layer band
+  double fineStepNm = 75.; // step size inside the gain-layer band
   double bulkStepNm = 800.;  /* step size everywhere else. Delayed cost is
                              linear in the segment count and the bulk field is
                              smooth, so a coarse step here is cheap accuracy.
@@ -338,7 +368,25 @@ struct RunConfig {
   double activeFieldMinVcm = 100.;
 
   bool spaceCharge = true;  // master switch for the Poisson correction
+  /* L_z: the effective out-of-plane extent of the avalanche charge cloud.
+    ComponentPoisson2d is a 2D solver and wants charge per unit length in the
+    unresolved z direction, so the carrier count is divided by this width.
+    Screening scales as 1/L_z.
+
+    With useMeasuredLz = true this is OVERRIDDEN per event by the
+    residence-time-weighted sigma_z measured from the transported 3D
+    trajectories (L_z = sqrt(12)*sigma_z), and the value below is used only
+    as a fallback and for override runs.
+
+    The 0.21 um legacy value was fitted to reproduce a Silvaco gain
+    suppression. Measured values are ~4.7 um at 300 V and ~5.3 um at 230 V,
+    i.e. more than 20x larger, so the fitted number overstates screening by
+    that factor. Keep it available for reproducing old runs, not for physics. */
   double scZExtentUm = 0.21;
+  /* Use the transport-measured L_z for screening instead of scZExtentUm.
+    Requires measureLz and a static pass (the measurement is taken there,
+    in the unscreened field, before the screened iteration begins). */
+  bool useMeasuredLz = true;
   int scMaxIter = 16;
   double scRelaxation = 0.25;     // damps stochastic avalanche forcing
   bool scWriteIterationHistory = false;
@@ -696,6 +744,12 @@ int main() {
   }
 
   PrintWeightingSanity(*weightingCmp, strips, yTop, yCollect, yBot);
+  if (cfg.doDynamicWeightingDump && dynamicWeightingActive) {
+    DumpDynamicWeighting(*weightingCmp, strips, bx0, bx1, yCollect, yBot,
+                         cfg.resistiveWeightingTimesNs,
+                         cfg.outDir + "weighting" +
+                             (biasLabel == "NA" ? "" : "_" + biasLabel + "V"));
+  }
 
   const double signalWindowNs = dynamicWeightingActive
       ? cfg.dynamicSignalWindowNs : cfg.staticSignalWindowNs;
@@ -928,6 +982,18 @@ int main() {
     scCfg.enabled = false;
   }
   const bool actuallyRunScreened = runScreened && scCfg.enabled;
+  if (cfg.useMeasuredLz && actuallyRunScreened) {
+    if (!cfg.measureLz) {
+      std::cerr << "useMeasuredLz requires measureLz = true.\n";
+      return 3;
+    }
+    if (!runStatic) {
+      std::cerr << "useMeasuredLz takes L_z from the static pass, but "
+                   "mipRunStatic is false. Enable the static pass or set "
+                   "useMeasuredLz = false to use scZExtentUm.\n";
+      return 3;
+    }
+  }
   if (!runStatic && !actuallyRunScreened) return 2;
 
   const std::string mipSuffix = biasLabel == "NA" ? "" : "_" + biasLabel + "V";
@@ -948,7 +1014,7 @@ int main() {
   fEvents << "event,bias,model,mode,nClusters,nPrimary,nTotal,countingGain,"
              "chargeGainPromptAbs,peakOn,peakOff,intOnSigned,intOffSigned,"
              "areaOnPositive,areaOnNegative,areaOnAbsolute,"
-             "zeroCrossingOn_ns,scZExtentUm,"
+             "zeroCrossingOn_ns,lzUsedUm,"
              "scIterations,scConverged,scCharge_e_per_cm,scField_Vcm,"
              "elapsed_s";
   for (const auto& strip : strips) {
@@ -1005,6 +1071,7 @@ int main() {
          << "\nrunScreened=" << (actuallyRunScreened ? 1 : 0)
          << "\nspaceChargeMaster=" << (cfg.spaceCharge ? 1 : 0)
          << "\nscZExtentUm=" << cfg.scZExtentUm
+         << "\nuseMeasuredLz=" << (cfg.useMeasuredLz ? 1 : 0)
          << "\nscMaxIter=" << cfg.scMaxIter
          << "\nscRelaxation=" << cfg.scRelaxation
          << "\nscConsoleVerbosity=" << cfg.scConsoleVerbosity
@@ -1036,6 +1103,8 @@ int main() {
          << (cfg.mipForceSerialAvalanches ? 1 : 0)
          << "\nuseResistiveGridWeighting="
          << (cfg.useResistiveGridWeighting ? 1 : 0)
+         << "\nmeasureLz=" << (cfg.measureLz ? 1 : 0)
+         << "\nlzBandHalfWidthUm=" << cfg.lzBandHalfWidthUm
          << "\nsheetResistanceOhmSq=" << cfg.sheetResistanceOhmSq
          << "\ncouplingEpsR=" << cfg.couplingEpsR
          << "\ncouplingOxideThicknessUm=" << cfg.couplingOxideThicknessUm
@@ -1103,6 +1172,9 @@ int main() {
     double elapsedS = 0.;
   };
 
+  /* L_z actually used by the most recent screened pass, in um. Declared out
+     here so writeModeRow can capture it; reassigned once per event. */
+  double lzUsedUm = cfg.scZExtentUm;
   const auto writeModeRow = [&](const int eventId, const char* mode,
                                 const unsigned long nClusters,
                                 const unsigned long nPrimary,
@@ -1118,7 +1190,7 @@ int main() {
             << "," << r.metrics.totalNegativeArea
             << "," << r.metrics.totalAbsoluteArea
             << "," << r.metrics.zeroCrossingAfterPeakNs[r.metrics.peakStrip]
-            << "," << (std::string(mode) == "screened" ? cfg.scZExtentUm : 0.)
+            << "," << (std::string(mode) == "screened" ? lzUsedUm : 0.)
             << "," << r.scIterations << "," << (r.scConverged ? 1 : 0)
             << "," << r.scSample.depositedChargeEPerCm << ","
             << r.scSample.magnitudeVcm << "," << r.elapsedS;
@@ -1135,6 +1207,7 @@ int main() {
   ChargeGrid previousConvergedGrid;
   bool havePreviousConvergedGrid = false;
   unsigned long previousConvergedPrimary = 0;
+  double previousConvergedLzUm = 0.;
   if (actuallyRunScreened) previousConvergedGrid.Init(scCfg);
 
   for (int iMip = 0; iMip < cfg.nMips; ++iMip) {
@@ -1260,6 +1333,10 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcSample, sampleSignal
       writeSampleSummary(mode, counting, charge, scFieldVcm);
     };
 
+    /* Per-event L_z measurement, filled by the static pass and consumed by
+       the screened pass below. Zero means "no valid measurement". */
+    double measuredLzUm = 0.;
+    double measuredSigmaZUm = 0.;
     ModeResult staticResult;
     if (runStatic) {
       const auto t0 = Clock::now();
@@ -1275,11 +1352,35 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcSample, sampleSignal
         pairs << "x_um,y_um,ne\n";
         pairPtr = &pairs;
       }
+      TransverseExtentAccumulator lzGain;
       staticResult.nTotal = RunAvalanchePass(
 cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult.signal, pairPtr,
           cfg.mipPairProgressEvery, "STATIC",
           nullptr, nullptr, nullptr, nullptr,
-          &staticResult.promptSignal, &staticResult.delayedSignal);
+          &staticResult.promptSignal, &staticResult.delayedSignal,
+          cfg.measureLz ? &lzGain : nullptr,
+          yGain - cfg.lzBandHalfWidthUm * 1.e-4,
+          yGain + cfg.lzBandHalfWidthUm * 1.e-4);
+      if (cfg.measureLz) {
+        const auto teGain = lzGain.Finish();
+        if (teGain.valid) {
+          measuredLzUm = teGain.lzCm * 1.e4;
+          measuredSigmaZUm = teGain.sigmaZCm * 1.e4;
+          std::cout << "  [L_z] gain-layer band +/-" << cfg.lzBandHalfWidthUm
+                    << " um about y=" << yGain * 1.e4 << " um: sigma_z = "
+                    << measuredSigmaZUm << " um,  L_z = sqrt(12)*sigma_z = "
+                    << measuredLzUm << " um   (" << teGain.nSegments
+                    << " segments, " << teGain.weightNsE << " carrier-ns)\n"
+                    << "  [L_z] legacy fitted scZExtentUm = "
+                    << cfg.scZExtentUm << " um  -> measured/fitted = "
+                    << (measuredLzUm / cfg.scZExtentUm) << "\n";
+        } else {
+          measuredLzUm = 0.;
+          std::cerr << "  [L_z] measurement invalid ("
+                    << teGain.nCarriersNoPath
+                    << " carriers had no stored path)\n";
+        }
+      }
       staticResult.metrics =
           MeasureSignal(staticResult.signal, pc.tStart, pc.tStep);
       staticResult.promptMetrics =
@@ -1307,6 +1408,27 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult
                             staticSampleCounting, staticSampleCharge, 0.);
     }
 
+    /* Apply the measured L_z to THIS event's screening. Poisson sees charge
+       per unit z, so this is the one place the measurement changes physics
+       rather than just being reported. Done per event because sigma_z
+       fluctuates a few percent with the Landau depth distribution. */
+    lzUsedUm = cfg.scZExtentUm;
+    if (cfg.useMeasuredLz && actuallyRunScreened) {
+      if (measuredLzUm > 0.) {
+        lzUsedUm = measuredLzUm;
+      } else {
+        std::cerr << "  [L_z] no valid measurement this event; falling back "
+                     "to scZExtentUm = " << cfg.scZExtentUm << " um\n";
+      }
+    }
+    scCfg.zExtentCm = lzUsedUm * 1.e-4;
+    if (actuallyRunScreened) {
+      std::cout << "  [L_z] screening will use L_z = " << lzUsedUm << " um"
+                << (cfg.useMeasuredLz && measuredLzUm > 0. ? " (measured)"
+                                                           : " (configured)")
+                << "\n";
+    }
+
     ModeResult screenedResult;
     if (actuallyRunScreened) {
       const auto t0 = Clock::now();
@@ -1331,7 +1453,14 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult
       if (cfg.scWarmStartEvents && havePreviousConvergedGrid &&
           previousConvergedPrimary > 0) {
         mixed = previousConvergedGrid;
-        const double rawScale = static_cast<double>(nPrimary) /
+        /* The stored grid is a charge DENSITY, already divided by the L_z of
+           the event that produced it. With a per-event measured L_z that
+           differs by a few percent, scale by the L_z ratio as well as by the
+           pair count, or the warm start starts from a slightly wrong density.
+           Only a small correction, but it costs nothing to be right. */
+        const double lzScale = (previousConvergedLzUm > 0. && lzUsedUm > 0.)
+            ? previousConvergedLzUm / lzUsedUm : 1.;
+        const double rawScale = lzScale * static_cast<double>(nPrimary) /
                                 previousConvergedPrimary;
         const double scaleLo = std::min(cfg.scWarmStartScaleMin,
                                         cfg.scWarmStartScaleMax);
@@ -1475,6 +1604,7 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcIter, sigIter, nullp
       if (cfg.scWarmStartEvents && screenedResult.scConverged) {
         previousConvergedGrid = mixed;
         previousConvergedPrimary = nPrimary;
+        previousConvergedLzUm = lzUsedUm;
         havePreviousConvergedGrid = true;
       }
 
@@ -1699,6 +1829,76 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcFinal, screenedResul
   if (runStatic && actuallyRunScreened) std::cout << "wrote " << pairedPath << "\n";
   std::cout << "[timer] total run so far: " << ElapsedS(tRunStart)
             << " s\n";
+
+  // ---- position scan --------------------------------------------------
+  if (cfg.doPositionScan) {
+    const std::string scanPath =
+        cfg.outDir + "position_scan" + mipSuffix + ".csv";
+    std::ofstream fScan(scanPath);
+    fScan << "x_track_um,event,nPrimary,gain";
+    for (const auto& s2 : strips) fScan << "," << s2.label << "_peak_uA";
+    for (const auto& s2 : strips) fScan << "," << s2.label << "_charge_fC";
+    for (const auto& s2 : strips) fScan << "," << s2.label << "_peakNorm";
+    for (const auto& s2 : strips) fScan << "," << s2.label << "_chargeNorm";
+    fScan << "\n";
+
+    const int nPts = static_cast<int>(
+        std::floor((cfg.scanXEndUm - cfg.scanXStartUm) / cfg.scanXStepUm)) + 1;
+    std::cout << "\n=== position scan: " << nPts << " points x "
+              << cfg.scanMipsPerPoint << " events, gain "
+              << (cfg.scanUseGain ? "ON" : "OFF") << " ===" << std::endl;
+    const auto tScan = Clock::now();
+
+    for (int ip = 0; ip < nPts; ++ip) {
+      const double xs = cfg.scanXStartUm + ip * cfg.scanXStepUm;
+      const double xsCm = xs * 1.e-4;
+      if (xsCm <= bx0 || xsCm >= bx1) continue;
+      for (int ie = 0; ie < cfg.scanMipsPerPoint; ++ie) {
+        // Fresh Heed track at this x. Offset by the same 0.13 um used for the
+        // nominal track so the position is not exactly on a mesh line.
+        track.NewTrack(xsCm + 0.13e-4, yTop + 0.03e-4, 0., 0., 0., 1., 0.);
+        double xc2 = 0., yc2 = 0., zc2 = 0., tc2 = 0., ec2 = 0., ex2 = 0.;
+        int nc2 = 0;
+        unsigned long nPrim = 0;
+        std::vector<std::array<double, 4>> prim;
+        while (track.GetCluster(xc2, yc2, zc2, tc2, nc2, ec2, ex2)) {
+          nPrim += nc2;
+          for (int k = 0; k < nc2; ++k) prim.push_back({xc2, yc2, zc2, tc2});
+        }
+        if (nPrim == 0) continue;
+
+        AvalanchePassConfig pcScan = pc;
+        pcScan.multiplication = cfg.scanUseGain;
+        pcScan.enableSignal = true;
+        std::vector<std::vector<double>> sig;
+        const unsigned long nTot = RunAvalanchePass(
+            cmp, *weightingCmp, perStripWeighting, strips, prim, pcScan, sig,
+            nullptr, 0, "SCAN");
+        const double gain = cfg.scanUseGain
+            ? static_cast<double>(nTot) / static_cast<double>(nPrim) : 1.;
+        const double norm = static_cast<double>(nPrim) * gain;
+
+        std::vector<double> peak(strips.size(), 0.), chg(strips.size(), 0.);
+        for (std::size_t k = 0; k < strips.size(); ++k) {
+          for (const double v : sig[k]) {
+            if (std::abs(v) > std::abs(peak[k])) peak[k] = v;
+            chg[k] += v * pc.tStep;
+          }
+        }
+        fScan << xs << "," << ie << "," << nPrim << "," << gain;
+        for (double v : peak) fScan << "," << v;
+        for (double v : chg) fScan << "," << v;
+        for (double v : peak) fScan << "," << v / norm;
+        for (double v : chg) fScan << "," << v / norm;
+        fScan << "\n";
+        fScan.flush();
+      }
+      std::cout << "  x = " << xs << " um done ("
+                << ElapsedS(tScan) << " s elapsed)" << std::endl;
+    }
+    std::cout << "wrote " << scanPath << "  ["
+              << ElapsedS(tScan) << " s]" << std::endl;
+  }
 
   std::cout << "[timer] TOTAL RUNTIME: " << ElapsedS(tRunStart)
             << " s" << std::endl;
