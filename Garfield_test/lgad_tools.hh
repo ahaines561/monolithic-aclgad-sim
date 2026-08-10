@@ -6,6 +6,7 @@
 #include <chrono>
 #include <fstream>
 #include <limits>
+#include <streambuf>
 #include <string>
 #include <utility>
 #include <vector>
@@ -330,6 +331,18 @@ void DumpTownsendCoefficients(
 
 double MedianOf(std::vector<std::size_t> v);
 
+/* Stateless discard buffer. Unlike an ofstream's filebuf this holds no
+   internal state, so concurrent writes from OpenMP workers cannot race.
+   Required because std::cerr's default stdio_sync_filebuf is thread-safe and
+   replacing it with a filebuf silently gives that guarantee up. */
+class NullStreamBuf : public std::streambuf {
+ public:
+  int overflow(int c) override { return c; }
+  std::streamsize xsputn(const char*, std::streamsize n) override {
+    return n;
+  }
+};
+
 struct ReadoutStrip {
   std::string label;
   double centerUm, halfWidthUm;
@@ -420,7 +433,8 @@ void DumpDynamicWeighting(Garfield::Component& wcmp,
                           double bx1, double yLo, double yHi,
                           const std::vector<double>& timesNs,
                           const std::string& outPrefix, int nx = 200,
-                          int ny = 120);
+                          int ny = 120,
+                          const std::vector<std::string>& extraLabels = {});
 
 struct DelayedWeightingValidation {
   bool available = false;

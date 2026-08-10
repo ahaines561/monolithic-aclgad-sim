@@ -23,5 +23,22 @@ target_link_libraries(probe_field Garfield::Garfield)
 # target_link_libraries(1000MIPs Garfield::Garfield OpenMP::OpenMP_CXX)
 add_executable(feedback_scan feedback_scan.cpp lgad_tools.cpp)
 target_link_libraries(feedback_scan Garfield::Garfield OpenMP::OpenMP_CXX)
+
+# --- M2/M5 tools -------------------------------------------------------------
+# sheet_psi_dump and sheet_prodcheck need only sheet_weighting.hh (header-only,
+# no Garfield). garfield_transport needs MediumSilicon. See tools/README.md.
+add_executable(sheet_psi_dump tools/sheet_psi_dump.cpp)
+target_include_directories(sheet_psi_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(sheet_prodcheck tools/sheet_prodcheck.cpp)
+target_include_directories(sheet_prodcheck PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Closed-form check of the sheet solver against Riegler arXiv:1602.07949 Eq.138.
+# The only EXTERNAL test of sheet_weighting.hh; everything else is self-consistency.
+add_executable(riegler_benchmark tools/riegler_benchmark.cpp)
+target_include_directories(riegler_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(garfield_transport tools/garfield_transport.cpp)
+target_link_libraries(garfield_transport Garfield::Garfield)
 # add_executable(rng_test rng_test.cpp lgad_tools.cpp)
 # target_link_libraries(rng_test Garfield::Garfield OpenMP::OpenMP_CXX)

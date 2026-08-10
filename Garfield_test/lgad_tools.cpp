@@ -394,18 +394,30 @@ void DumpDynamicWeighting(Component& wcmp,
                           const double bx0, const double bx1, const double yLo,
                           const double yHi, const std::vector<double>& timesNs,
                           const std::string& outPrefix, const int nx,
-                          const int ny) {
+                          const int ny,
+                          const std::vector<std::string>& extraLabels) {
   const auto tStart = Clock::now();
   // Probe point: mid-depth under the first strip, for the summary trace.
   const double xProbe = strips.empty() ? 0.5 * (bx0 + bx1)
                                        : strips.front().centerUm * 1.e-4;
   const double yProbe = 0.5 * (yLo + yHi);
 
+  /* Readout strips first, then any extras (the DC contact and the backplane).
+     Keeping that order means a reader keyed on the strip columns is unaffected
+     by whether the extras are present. */
+  std::vector<std::string> labels;
+  for (const auto& s : strips) labels.push_back(s.label);
+  for (const auto& l : extraLabels) labels.push_back(l);
+  /* sum_k psi_k == 1 holds only over EVERY electrode, so the residual is
+     meaningful only when the extras are present. Reported as -1 otherwise
+     rather than as a misleadingly large number. */
+  const bool complete = !extraLabels.empty();
+
   std::ofstream fs(outPrefix + "_summary.csv");
   fs << "t_ns";
-  for (const auto& s : strips) fs << "," << s.label << "_maxAbsPsi";
-  for (const auto& s : strips) fs << "," << s.label << "_psiProbe";
-  fs << "\n";
+  for (const auto& l : labels) fs << "," << l << "_maxAbsPsi";
+  for (const auto& l : labels) fs << "," << l << "_psiProbe";
+  fs << ",sum_psi_residual\n";
 
   // Index -1 denotes the prompt map; >= 0 indexes timesNs.
   for (int it = -1; it < static_cast<int>(timesNs.size()); ++it) {
@@ -415,42 +427,43 @@ void DumpDynamicWeighting(Component& wcmp,
        << "_" << std::fixed << std::setprecision(3) << t << "ns.csv";
     std::ofstream fw(fn.str());
     fw << "x_um,y_um";
-    for (const auto& s : strips) fw << "," << s.label << "_psi";
+    for (const auto& l : labels) fw << "," << l << "_psi";
     fw << "\n";
 
-    std::vector<double> maxAbs(strips.size(), 0.), probe(strips.size(), 0.);
+    std::vector<double> maxAbs(labels.size(), 0.), probe(labels.size(), 0.);
+    double resid = 0.;
     for (int ix = 0; ix <= nx; ++ix) {
       const double x = bx0 + (bx1 - bx0) * ix / nx;
       for (int iy = 0; iy <= ny; ++iy) {
         const double y = yLo + (yHi - yLo) * iy / ny;
         fw << x * 1.e4 << "," << y * 1.e4;
-        for (std::size_t k = 0; k < strips.size(); ++k) {
+        double sum = 0.;
+        for (std::size_t k = 0; k < labels.size(); ++k) {
           // Prompt plus delayed remainder = the potential the signal sees.
-          double psi = wcmp.WeightingPotential(x, y, 0., strips[k].label);
+          double psi = wcmp.WeightingPotential(x, y, 0., labels[k]);
           if (it >= 0) {
-            psi += wcmp.DelayedWeightingPotential(x, y, 0., t,
-                                                  strips[k].label);
+            psi += wcmp.DelayedWeightingPotential(x, y, 0., t, labels[k]);
           }
           if (!std::isfinite(psi)) psi = 0.;
           fw << "," << psi;
           maxAbs[k] = std::max(maxAbs[k], std::abs(psi));
+          sum += psi;
         }
         fw << "\n";
+        resid = std::max(resid, std::abs(sum - 1.));
       }
     }
-    for (std::size_t k = 0; k < strips.size(); ++k) {
-      double psi = wcmp.WeightingPotential(xProbe, yProbe, 0.,
-                                           strips[k].label);
+    for (std::size_t k = 0; k < labels.size(); ++k) {
+      double psi = wcmp.WeightingPotential(xProbe, yProbe, 0., labels[k]);
       if (it >= 0) {
-        psi += wcmp.DelayedWeightingPotential(xProbe, yProbe, 0., t,
-                                              strips[k].label);
+        psi += wcmp.DelayedWeightingPotential(xProbe, yProbe, 0., t, labels[k]);
       }
       probe[k] = std::isfinite(psi) ? psi : 0.;
     }
     fs << t;
     for (double v : maxAbs) fs << "," << v;
     for (double v : probe) fs << "," << v;
-    fs << "\n";
+    fs << "," << (complete ? resid : -1.) << "\n";
   }
   std::cout << "  dynamic weighting dumped: " << (timesNs.size() + 1)
             << " time slices -> " << outPrefix << "_t*.csv  ("
@@ -647,33 +660,39 @@ unsigned long RunAvalanchePass(
   const auto tStart = Clock::now();
   const long long nPrim = static_cast<long long>(primaries.size());
 
-  // Garfield prints an oversubscription notice per avalanche when called
-  // from inside an OpenMP region. That IS the intended behaviour here
-  // (one Garfield thread per OpenMP thread), but it floods stderr.
-  std::ofstream devNull;
+  /* Garfield prints an oversubscription notice per avalanche when called
+     from inside an OpenMP region. That IS the intended behaviour here (one
+     Garfield thread per OpenMP thread), but it floods stderr.
+
+     THREAD SAFETY. Do NOT redirect to an ofstream's filebuf. std::cerr
+     normally uses a stdio_sync_filebuf, which is thread-safe; a std::filebuf
+     is not. AvalancheMC::DriftLine writes to std::cerr in 19 places ("Too
+     small electric field", "Too small drift velocity", "Invalid mobility",
+     ...), so with several OpenMP workers those warnings race on a shared
+     filebuf and segfault inside __ostream_insert. The null buffer below is
+     stateless -- it discards without touching any member -- so concurrent
+     calls from any number of threads are safe. */
+  static NullStreamBuf nullBuf;
   std::streambuf* oldCerr = nullptr;
   if (pc.silenceGarfieldStderr) {
-    devNull.open("/dev/null");
-    oldCerr = std::cerr.rdbuf(devNull.rdbuf());
+    oldCerr = std::cerr.rdbuf(&nullBuf);
   }
 
   // Garfield's TransportParticles progress meter is written to stdout.
   // Redirect stdout for the full pass so large MIP ensembles do not emit one
   // progress line per primary. main.cpp prints event summaries after return.
-  std::ofstream devNullPass;
   std::streambuf* oldCoutPass = nullptr;
   if (pc.silenceGarfieldAvalancheStdout) {
-    devNullPass.open("/dev/null");
-    if (devNullPass) oldCoutPass = std::cout.rdbuf(devNullPass.rdbuf());
+    // Same thread-safety requirement as stderr above: this redirect is live
+    // across the OpenMP region, so it must not use a filebuf.
+    oldCoutPass = std::cout.rdbuf(&nullBuf);
   }
 
   // Optional narrower setup-only suppression when full-pass suppression is
   // disabled.
-  std::ofstream devNullSetup;
   std::streambuf* oldCout = nullptr;
   if (!oldCoutPass && pc.silenceGarfieldSetupStdout) {
-    devNullSetup.open("/dev/null");
-    if (devNullSetup) oldCout = std::cout.rdbuf(devNullSetup.rdbuf());
+    oldCout = std::cout.rdbuf(&nullBuf);
   }
 
 

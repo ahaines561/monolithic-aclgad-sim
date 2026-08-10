@@ -1,3 +1,5 @@
 build/
 .vscode/
 lgad.cpp-output/
+tools/
+*.csv
