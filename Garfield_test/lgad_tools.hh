@@ -19,23 +19,8 @@
 
 using Clock = std::chrono::steady_clock;
 
-/* Silicon with a screening correction applied to impact ionisation only.
-
-Garfield has no space-charge feedback: the avalanche never perturbs the
-field it grows in. Silvaco's coupled Poisson solve does, and that is the
-whole measured Garfield/Silvaco gain gap -- a ~2.4% (150 V) to ~3.1%
-(180 V) effective deficit in the gain-layer field.
-
-This scales the field seen by the Townsend calculation ONLY. Drift
-velocity, diffusion and timing are untouched, which is deliberate: the
-gain-OFF passes of the two codes already agree, so drift is validated and
-must not be modified. AvalancheMC::GetTownsend falls through to the
-medium when no Townsend map is loaded, and LoadSilvaco imports only the
-potential and field, so this override is the multiplication path.
-
-Set the scale as f = 1 - kappa * G, with kappa calibrated once against a
-known Garfield/Silvaco pair (kappa = 0.00313 for lgad_deepjte, Okuto).
-f = 1 restores stock behaviour exactly. */
+/* Scales the field seen by impact ionisation only (drift is validated, left
+   untouched). f = 1 - kappa*G; kappa = 0.00313 for lgad_deepjte/Okuto. */
 class ScreenedSilicon : public Garfield::MediumSilicon {
  public:
   void SetFieldScale(const double f) { m_fscale = f; }
@@ -62,144 +47,74 @@ class ScreenedSilicon : public Garfield::MediumSilicon {
 
 double ElapsedS(const Clock::time_point& t0);
 
-/* AvalancheMC drifts carriers through a frozen field, so the avalanche never
-screens the gain layer it grows in silvaco's coupled Poisson solve does,
-and that is the measured ~2.4% (150 V) to ~3.1% (180 V) effective
-gain-layer field deficit behind the Garfield/Silvaco gain gap.
-
-ComponentPoisson2d solves Poisson on a triangular FEM mesh and accepts
-deposited charge directly through AddCharge (elementary charges per cm of
-depth) with a consistent finite-element load. It applies the medium's
-relative permittivity properly, and Solve() reuses the existing
-factorisation, so each feedback iteration costs one back-substitution
-rather than a refactorisation.
-
-Layering: Sensor::ElectricField sums over components, so
-
-    sensor.AddComponent(&cmp);   // ComponentTcad2d, the Silvaco field
-    sensor.AddComponent(&sc);    // ComponentPoisson2d, the perturbation
-
-gives E_total = E_TCAD + E_screening. Add the TCAD component FIRST: the
-sensor takes its medium from the first component returning status 0.
-
-The TCAD map already carries the equilibrium space charge (ionised
-dopants), so SetDoping is deliberately NOT called here. This component
-must hold only the avalanche's excess carriers, or the depletion charge
-is counted twice. */
+/* Space-charge feedback via ComponentPoisson2d, layered on the TCAD map:
+     sensor.AddComponent(&cmp);  // TCAD first: sensor takes its medium from it
+     sensor.AddComponent(&sc);   // screening perturbation
+   No SetDoping: the TCAD map already holds the depletion charge. */
 struct SpaceChargeConfig {
-  // FEM region outline [cm]; normally the field-map bounding box.
-  // ComponentPoisson2d wants polygon edges parallel to x or y, so a
-  // rectangle is the natural choice.
+  // FEM region [cm]; edges must be axis-parallel
   double xMinCm = 0., xMaxCm = 0.;
   double yMinCm = 0., yMaxCm = 0.;
   double zMinCm = -5.e-4, zMaxCm = 5.e-4;
 
-  // target element size near electrodes (hmin) and in the bulk (hmax) [cm]
-  double hMinCm = 0.02e-4;
-  double hMaxCm = 0.50e-4;
+  double hMinCm = 0.02e-4;  // element size near electrodes
+  double hMaxCm = 0.50e-4;  // element size in bulk
 
-  /* Effective z-extent of the charge column [cm]. THIS IS THE PHYSICS
-     INPUT, not a numerical knob. A 2D solve treats charge as uniform in
-     z, and AddCharge takes elementary charges per cm of depth, so the
-     carrier count is divided by this. Match it to the track
-     cross-section Silvaco's SEU assumes; getting it wrong scales the
-     whole screening effect linearly. */
+  // Effective z-extent of the charge column [cm]. Physics input: screening
+  // scales linearly with 1/zExtentCm.
   double zExtentCm = 1.e-4;
 
-  // window over which the carrier density is time-averaged [ns]
-  double tWindowNs = 1.;
+  double tWindowNs = 1.;  // charge time-averaging window
 
-  int maxIter = 6;           // max space-charge feedback iterations
+  int maxIter = 6;
 
-  /* Under-relaxation:  rho_used = (1-lambda)*rho_prev + lambda*rho_new.
-     The undamped map (lambda = 1) oscillates with contraction ratio
-     r ~ -0.5 on this device, so it converges but slowly. The optimum is
-     lambda = 1/(1-r) ~ 0.67; 0.5 is near-optimal with margin. */
+  // rho = (1-lambda)*rho_prev + lambda*rho_new; optimum ~0.67, 0.5 for margin
   double relaxation = 0.5;
 
-  /* Auxiliary grid for the spatial mixing, in nodes. The blend must be
-     done on the charge DENSITY, not on a scalar amplitude: the cloud's
-     shape changes between iterations (field/charge varied 44% across one
-     measured run), so scaling the magnitude alone is not equivalent. */
+  // Mixing grid nodes; blend density, not amplitude (cloud shape changes)
   int mixNx = 101, mixNy = 501;
 
-  /* The screening field is the fixed-point state variable. Convergence is
-     checked on the full sampled screening field in the gain-layer
-     neighbourhood. Gain remains an observable/diagnostic and is evaluated
-     on the converged field in a final signal pass. Requiring three stable
-     transitions avoids stopping on one accidental close pair. */
+  // Converged when the sampled screening field changes < fieldTol for
+  // stableIterations consecutive iterations.
   double fieldTol = 0.01;
   int stableIterations = 3;
   int fieldSampleNx = 11;
   int fieldSampleNy = 41;
-  double fieldSampleXHalfWidthCm = 5.e-4;  // 5 um
-  double fieldSampleYHalfWidthCm = 1.e-4;  // 1 um
+  double fieldSampleXHalfWidthCm = 5.e-4;
+  double fieldSampleYHalfWidthCm = 1.e-4;
 
-  /* Gain remains a diagnostic only; stochastic avalanche fluctuations do
-     not gate field convergence. Relaxation provides noise suppression. */
-  double gainTol = 0.01;     // diagnostic only; does not gate convergence
+  double gainTol = 0.01;  // diagnostic only
 
-  // probe point for the screening-field diagnostic [cm]
   double xProbeCm = 0., yProbeCm = 0.;
 
-  bool enabled = false;      // OFF by default: preserves stock behaviour
+  bool enabled = false;
   bool verbose = true;
 };
 
-/* Build the FEM region, grounded electrodes and mesh, then Initialise().
-   Doping is left unset (nd = na = 0) so the component carries only
-   deposited charge. Returns false if Initialise() fails. */
+// Builds the FEM region, grounded electrodes and mesh (no doping).
 bool SetupSpaceCharge(Garfield::ComponentPoisson2d& sc,
                       const SpaceChargeConfig& cfg,
                       Garfield::Medium* medium);
 
-/* ---------------------------------------------------------------------
-   Transport-derived effective out-of-plane extent L_z.
-
-   ComponentPoisson2d is a 2D solver: it wants charge per unit length in the
-   unresolved z direction, so the avalanche charge must be divided by some
-   effective transverse width. That width was previously the hand-set
-   constant scZExtentUm = 0.21 um, chosen because it reproduced the gain
-   suppression seen in Silvaco -- i.e. it was fitted to the very observable
-   the screening model is supposed to predict.
-
-   This measures it instead. Garfield transports in full 3D even when the
-   FIELD is z-invariant, so Point::z carries the real transverse spread
-   accumulated by diffusion. Weighting by residence time w_j * dt_j gives the
-   time-averaged transverse charge distribution actually seen by Poisson's
-   equation, rather than a snapshot or an endpoint tally:
-
-     zbar     = sum_j w_j dt_j z_j / sum_j w_j dt_j
-     sigma_z^2= sum_j w_j dt_j (z_j - zbar)^2 / sum_j w_j dt_j
-
-   A uniform slab with the same RMS width has full width sqrt(12)*sigma_z,
-   which is the number ComponentPoisson2d should be handed.
-
-   yLoCm/yHiCm restrict the sum to a band in depth. Screening only matters
-   where the carrier density is high and the field is critical, so the
-   physically meaningful L_z is the one measured ACROSS THE GAIN LAYER, not
-   averaged over the whole 50 um bulk where late holes have diffused far. */
+/* Measured out-of-plane extent L_z (replaces the fitted 0.21 um).
+   Residence-time weighted (w*dt) z spread of transported carriers;
+   lz = sqrt(12)*sigma_z. Restrict yLo/yHi to the gain layer. */
 struct TransverseExtent {
   double zBarCm = 0.;
   double sigmaZCm = 0.;
-  double lzCm = 0.;          // sqrt(12) * sigmaZ
-  double weightNsE = 0.;     // total sum of w_j dt_j (carrier-ns)
+  double lzCm = 0.;
+  double weightNsE = 0.;  // sum of w*dt [carrier-ns]
   std::size_t nSegments = 0;
   std::size_t nCarriersNoPath = 0;
   bool valid = false;
 };
 
-/* Residence-time-weighted transverse spread of one avalanche.
-   REQUIRES aval.EnableDriftLines(true). Pass yLoCm >= yHiCm to use all
-   depths. Electrons and holes are combined by default because both
-   contribute to the screening charge density. */
+// Requires aval.EnableDriftLines(true). yLoCm >= yHiCm uses all depths.
 TransverseExtent MeasureTransverseExtent(const Garfield::AvalancheMC& aval,
                                          double yLoCm = 0., double yHiCm = 0.,
                                          bool useElectrons = true,
                                          bool useHoles = true);
 
-/* Same, but accumulated across many avalanches (one MIP = many primaries).
-   Merge with Add() then call Finish(). */
 struct TransverseExtentAccumulator {
   double sumW = 0., sumWz = 0., sumWz2 = 0.;
   std::size_t nSegments = 0, nCarriersNoPath = 0;
@@ -209,32 +124,19 @@ struct TransverseExtentAccumulator {
   TransverseExtent Finish() const;
 };
 
-/* Deposit one avalanche's carriers, weighted by residence time.
-   Electrons negative, holes positive; their separation is what opposes
-   the gain-layer field. Does NOT call Solve() -- the caller does that
-   once per iteration, after all avalanches have been deposited.
-
-   REQUIRES aval.EnableDriftLines(true). AvalancheMC does not store drift
-   paths otherwise (m_storeDriftLines defaults to false), so every
-   EndPoint::path is empty and this silently deposits nothing.
-
-   Returns the number of path segments that fell outside the mesh. */
+/* Deposits carriers (e-, h+) weighted by residence time; no Solve().
+   Requires aval.EnableDriftLines(true), else silently deposits nothing.
+   Returns segments outside the mesh. */
 std::size_t DepositAvalancheCharge(const Garfield::AvalancheMC& aval,
                                    Garfield::ComponentPoisson2d& sc,
                                    const SpaceChargeConfig& cfg);
 
-/* Auxiliary grid holding the avalanche charge density so successive
-   iterations can be blended spatially. Charge is deposited cloud-in-cell
-   onto the four surrounding nodes, which conserves total charge and keeps
-   sub-cell position information -- important because the gain layer is
-   thin compared with any practical cell size. */
+// Cloud-in-cell charge density grid for blending iterations.
 struct ChargeGrid {
   int nx = 0, ny = 0;
   double xMinCm = 0., xMaxCm = 0., yMinCm = 0., yMaxCm = 0.;
-  // Cached inverse node spacing. Charge deposition is in the avalanche
-  // hot path, so avoid recomputing two divisions for every drift segment.
   double invDx = 0., invDy = 0.;
-  std::vector<double> rho;       // charge per node [e / cm of depth]
+  std::vector<double> rho;  // [e / cm of depth]
 
   void Init(const SpaceChargeConfig& cfg);
   void Clear() { std::fill(rho.begin(), rho.end(), 0.); }
@@ -242,7 +144,7 @@ struct ChargeGrid {
     return xCm >= xMinCm && xCm <= xMaxCm &&
            yCm >= yMinCm && yCm <= yMaxCm;
   }
-  void Deposit(double xCm, double yCm, double q);   // checked cloud-in-cell
+  void Deposit(double xCm, double yCm, double q);
   void DepositUnchecked(double xCm, double yCm, double q) noexcept;
   double Total() const;
   double AbsoluteTotal() const;
@@ -250,17 +152,12 @@ struct ChargeGrid {
   double NodeY(int iy) const;
 };
 
-/* Accumulate one avalanche into the grid, residence-time weighted.
-   Same physics as DepositAvalancheCharge but into the mixing grid
-   instead of straight into the solver. Returns segments that fell
-   outside the grid. */
+// As DepositAvalancheCharge, into the grid. Returns segments outside it.
 std::size_t DepositAvalancheIntoGrid(const Garfield::AvalancheMC& aval,
                                      ChargeGrid& grid,
                                      const SpaceChargeConfig& cfg);
 
-/* mixed = (1-lambda)*mixed + lambda*fresh, then push the result into the
-   Poisson solver (ClearCharge + one AddCharge per non-empty node).
-   Does NOT call Solve(). */
+// Neither calls Solve().
 void LoadChargeGrid(Garfield::ComponentPoisson2d& sc,
                     const ChargeGrid& grid);
 
@@ -290,40 +187,28 @@ struct ScreeningFieldChange {
   std::size_t nCompared = 0;
 };
 
-/* Sample the perturbation field on a fixed grid centred on the track and
-   gain layer. This catches field-shape changes that a single probe cannot. */
 ScreeningFieldGridSample SampleScreeningFieldGrid(
     Garfield::ComponentPoisson2d& sc, const SpaceChargeConfig& cfg);
 
-/* Compare two samples made on the same grid. */
 ScreeningFieldChange CompareScreeningFieldGrids(
     const ScreeningFieldGridSample& previous,
     const ScreeningFieldGridSample& current);
 
-/* Sample the solved perturbation field and deposited line charge at the
-   configured probe point. Useful for event-level CSV diagnostics. */
 ScreeningFieldSample SampleScreeningField(
     Garfield::ComponentPoisson2d& sc, const SpaceChargeConfig& cfg);
 
-/* Report the screening field at the probe point. Call after Solve().
-   A few thousand V/cm against a ~376 kV/cm gain layer is the expected
-   scale; ~100 kV/cm means zExtentCm is far too small. */
+// Expect a few kV/cm; ~100 kV/cm means zExtentCm is far too small.
 void ReportScreeningField(Garfield::ComponentPoisson2d& sc,
                           const SpaceChargeConfig& cfg);
 
-// pulls e.g. 190 out of ".../lgad190V.sta" or "lgad_190V.sta"
+// "lgad190V.sta" -> 190
 double ParseBiasFromFilename(const std::string& path);
 
-// "NA" if unparsed; whole numbers print without a decimal point
 std::string FormatBias(double v);
 
-/* Select one of the supported MediumSilicon impact-ionisation models.
-   Returns false and prints an error for an unknown model name. */
 bool SetImpactIonisationModel(Garfield::MediumSilicon& si,
                               const std::string& model);
 
-/* Export the coefficients actually evaluated by Garfield at the current
-   medium temperature/model. Field and coefficients are in V/cm and cm^-1. */
 void DumpTownsendCoefficients(
     Garfield::MediumSilicon& si, const std::string& csvPath,
     double eMinVcm = 1.e5, double eMaxVcm = 4.5e5,
@@ -331,10 +216,7 @@ void DumpTownsendCoefficients(
 
 double MedianOf(std::vector<std::size_t> v);
 
-/* Stateless discard buffer. Unlike an ofstream's filebuf this holds no
-   internal state, so concurrent writes from OpenMP workers cannot race.
-   Required because std::cerr's default stdio_sync_filebuf is thread-safe and
-   replacing it with a filebuf silently gives that guarantee up. */
+// Stateless discard buffer; safe for concurrent OpenMP writes.
 class NullStreamBuf : public std::streambuf {
  public:
   int overflow(int c) override { return c; }
@@ -357,14 +239,10 @@ void ScanValidity(Garfield::Component& cmp, double x0, double x1,
 
 struct FieldProfile {
   double yTop = 0., yBot = 0., d = 0., yGain = 0., eMax = 0.;
-  bool valid = false;  // false if no valid drift medium found on the line
+  bool valid = false;
 };
 
-/* 1D scan at x0 from y0 to y1: finds the active-silicon bounds and the
-gain-layer peak, writes the profile to a text file. Prints its own
-diagnostics (active silicon bounds, peak field, low-field NOTE, or the
-"no valid drift medium" error if !valid).*/
-
+// 1D scan at x0: active-silicon bounds and gain-layer peak.
 FieldProfile ScanFieldProfile(Garfield::Component& cmp, double x0,
                               double y0, double y1, int nScan,
                               const std::string& csvPath,
@@ -375,20 +253,13 @@ struct FieldDumpResult {
   double wMax = 0., wMaxX = 0., wMaxY = 0.;
 };
 
-/* E-field over an nx*ny grid spanning [x0,x1]x[y0,y1], to a text file:
-x_um,y_um,Ex_Vcm,Ey_Vcm,Emag_Vcm,V. 
-
-Does not print -- callers want different summary lines (window vs full-device); use the returned result to print. */
+// Columns: x_um,y_um,Ex_Vcm,Ey_Vcm,Emag_Vcm,V. Does not print.
 FieldDumpResult DumpElectricField(Garfield::Component& cmp, double x0,
                                   double x1, double y0, double y1, int nx,
                                   int ny, const std::string& csvPath,
                                   double eps = 0.013e-4);
 
-/* Avalanche Stepping
-- step function (fine band around gain layer, coarse elsewhere)
-- size cap
-- time window
-- stepCm captured by ref so RunConvergenceScan can tune it */
+// Fine step in the gain-layer band, coarse elsewhere.
 void ConfigureAvalanche(Garfield::AvalancheMC& av, double& stepCm,
                         double bulkStepCm, double yFineLoCm,
                         double yFineHiCm, double timeWindowNs,
@@ -400,34 +271,19 @@ void ConfigureAvalanche(Garfield::AvalancheMC& av, double& stepCm,
                         std::atomic<long long>& nPrinted);
 
 
-/* weighting field
-- per-strip Ew/wpot startup check (probed just inside the gap) 
--plus an overlap sanity check under strip0. Pure diagnostic printing. */
 void PrintWeightingSanity(Garfield::Component& wcmp,
                           const std::vector<ReadoutStrip>& strips, double yTop,
                           double yCollectHint, double yBot);
 
-// per-strip weighting potential over a grid, to a text file:
-// x_um,y_um,<label>_phi,...
+// Columns: x_um,y_um,<label>_phi,...
 void DumpWeightingField(Garfield::Component& wcmp,
                         const std::vector<ReadoutStrip>& strips, double bx0,
                         double bx1, double yTop, double yBot,
                         const std::string& outPath, int nx = 250,
                         int ny = 150);
 
-/* Time-resolved dump of the FULL weighting potential
-     psi_k(x, y, t) = prompt_k(x, y) + delayed_k(x, y, t)
-   on a regular grid, one file per requested time. This is the quantity the
-   signal calculation actually uses, so it is what you want to inspect when a
-   waveform looks wrong.
-
-   Writes <prefix>_t<index>_<time>ns.csv with columns
-     x_um, y_um, <label>_psi, ...
-   plus a <prefix>_summary.csv giving, per time and per electrode, the maximum
-   |psi| and the value at a probe point -- enough to see the relaxation without
-   opening every grid file.
-
-   Passing an empty timesNs dumps only the prompt map (t = 0+). */
+/* psi_k(x,y,t) = prompt + delayed, one CSV per time, plus
+   <prefix>_summary.csv. Empty timesNs dumps the prompt map only. */
 void DumpDynamicWeighting(Garfield::Component& wcmp,
                           const std::vector<ReadoutStrip>& strips, double bx0,
                           double bx1, double yLo, double yHi,
@@ -440,81 +296,51 @@ struct DelayedWeightingValidation {
   bool available = false;
   std::vector<double> timesNs;
   std::string message;
-  // Largest |delayed weighting potential| seen by the live probe. Stays 0 if
-  // the probe was skipped (probeYCm <= 0).
-  double probedDelayedMax = 0.;
+  double probedDelayedMax = 0.;  // 0 if probe skipped
 };
 
-/* Check that every requested electrode label has the same non-empty,
-   strictly increasing delayed-weighting time grid, AND that the delayed
-   weighting POTENTIAL is actually non-null there.
-
-   The time-grid check alone is not sufficient: DelayedSignalTimes() falls back
-   from the potential store to the field store, so it succeeds even when the
-   store the signal path reads is empty. Pass probeYCm > 0 (a depth inside the
-   bulk, in cm) to enable the live probe; pass 0 to skip it. */
+/* Checks a shared, increasing delayed-weighting time grid AND a non-null
+   delayed potential (DelayedSignalTimes alone can pass on an empty store).
+   probeYCm > 0 enables the live probe. */
 DelayedWeightingValidation ValidateDelayedWeightingData(
     Garfield::Component& weightingCmp,
     const std::vector<ReadoutStrip>& strips,
     double probeYCm = 0.);
 
-/* parallel avalanche pass (OpenMP)
-- one Sensor + one AvalancheMC per thread; only the read-only field
-  components are shared. Mirrors the pattern proven in 1000MIPs.cpp.
-- per-thread signals are summed at the end (induced signals are additive)
-- returns total electrons after multiplication
-- compiles and runs correctly WITHOUT -fopenmp (pragmas ignored, serial) */
+// One Sensor + AvalancheMC per OpenMP thread; returns total electrons.
 struct AvalanchePassConfig {
+  // Optional drift-path CSV for animation, capped at driftMaxCarriers.
+  std::ostream* driftCsv = nullptr;
+  long driftMaxCarriers = 400;
   double fineStepCm = 5.e-6, bulkStepCm = 2.5e-5;
   double yFineLoCm = 0., yFineHiCm = 0.;
   double timeWindowNs = 4.;
   std::size_t sizeCap = 5000;
   bool multiplication = true;
-  // Diagnostic switch. AvalancheMC diffusion is enabled by default;
-  // setting this false calls EnableDiffusion(false) for every local avalanche.
   bool diffusion = true;
   bool enableSignal = true;
   double xMin = 0., yMin = 0., zMin = 0., xMax = 0., yMax = 0., zMax = 0.;
   double tStart = 0., tStep = 0.005;
   unsigned int nBins = 800;
-  // Garfield warns once per avalanche that it is running
-  // single-threaded inside an OpenMP region (which is the intended
-  // behaviour) -- hundreds of lines. Silencing also hides genuine
-  // stderr warnings such as "not in a valid drift region".
+  // Also hides genuine warnings like "not in a valid drift region".
   bool silenceGarfieldStderr = true;
-  // Silence Garfield's per-avalanche transport progress meter and other
-  // routine stdout emitted while the pass is running. Event-level summaries
-  // are printed by main.cpp after RunAvalanchePass returns, so they remain
-  // visible. Set false only for Garfield transport debugging.
   bool silenceGarfieldAvalancheStdout = true;
-  // AddElectrode and SetTimeWindow write routine setup messages to stdout.
-  // This narrower switch is used only when full-pass stdout silencing is off.
   bool silenceGarfieldSetupStdout = true;
-  // Include the delayed weighting-field contribution in the signal.
-  // The weighting component registered with Sensor::AddElectrode must provide
-  // DelayedWeightingPotential/Field for each requested electrode label.
   bool enableDelayedSignal = false;
-  // If true, an absent/inconsistent dynamic weighting map is an error.
-  // Keep this enabled for any run advertised as an AC-LGAD bipolar-signal run.
+  // Keep on for any AC-LGAD bipolar-signal run.
   bool requireDelayedWeightingData = true;
   std::vector<double> delayedSignalTimesNs;
   std::size_t delayedSignalAveragingOrder = 0;
 
-  // Dynamic OpenMP chunk. Small chunks improve load balance because
-  // avalanche sizes vary strongly from one primary pair to another.
   int ompDynamicChunk = 4;
 
-  // Optional serial execution for debugging or thread-safety studies.
   bool forceSerial = false;
 };
 
 unsigned long RunAvalanchePass(
     Garfield::Component& driftCmp,
     Garfield::Component& weightingCmp,
-    // Optional: one weighting component PER STRIP, aligned with `strips`.
-    // Required for ComponentGrid, which ignores the electrode label and can
-    // therefore hold only one electrode per instance. When empty, every strip
-    // is read from the single `weightingCmp`.
+    // One per strip (ComponentGrid holds one electrode); empty = weightingCmp.
     const std::vector<Garfield::Component*>& perStripWeighting,
     const std::vector<ReadoutStrip>& strips,
     const std::vector<std::array<double, 4>>& primaries,
@@ -522,50 +348,28 @@ unsigned long RunAvalanchePass(
     std::vector<std::vector<double>>& signalOut,
     std::ofstream* pairsCsv, unsigned long printEvery,
     const std::string& tag,
-    /* Optional space-charge feedback. If scField is given it is added to
-       every thread-local sensor, so carriers drift in E_TCAD + E_screen.
-       If scDeposit and scCfg are given, each avalanche's carriers are
-       deposited as they are produced (AddCharge is mutex-protected, so
-       this is safe from inside the parallel loop). Solve() is NOT called
-       here -- the caller does that between iterations. */
+    // Space charge: scField adds to the field; scDeposit/scGrid collect charge.
+    // Caller calls Solve().
     Garfield::Component* scField = nullptr,
     Garfield::ComponentPoisson2d* scDeposit = nullptr,
     const SpaceChargeConfig* scCfg = nullptr,
-    /* If scGrid is given, carriers are accumulated into the mixing grid
-       instead of straight into the solver, so the caller can blend
-       iterations. Each thread fills a private copy which is summed at
-       the end, so this is safe in parallel. */
     ChargeGrid* scGrid = nullptr,
-    /* Optional decomposition of the total signal. These arrays are filled
-       only when non-null. delayedSignalOut is meaningful only when
-       enableDelayedSignal=true and the weighting component supplies a
-       dynamic weighting potential or field. */
     std::vector<std::vector<double>>* promptSignalOut = nullptr,
     std::vector<std::vector<double>>* delayedSignalOut = nullptr,
-    /* If non-null, the residence-time-weighted transverse spread of every
-       transported carrier is accumulated here, giving a measured L_z instead
-       of the hand-set scZExtentUm. Forces drift-line storage on, which costs
-       memory, so leave it null when not measuring. lzBandLoCm/HiCm restrict
-       the sum to a depth band (pass equal values for all depths); the
-       physically relevant band is the gain layer. */
+    // Measures L_z; forces drift-line storage on.
     TransverseExtentAccumulator* lzAcc = nullptr,
     double lzBandLoCm = 0., double lzBandHiCm = 0.);
 
-/* convergence scan
-G_e/G_eh vs step size at a fixed injection point; avalLadder must
-already be configured via ConfigureAvalanche. */
+// G_e/G_eh vs step size; avalLadder must be configured via ConfigureAvalanche.
 void RunConvergenceScan(Garfield::AvalancheMC& avalLadder, double& stepCm,
                         double x0, double yInj, std::size_t sizeCap,
                         const std::string& outDir);
 
 
 struct FeedbackScanConfig {
-  // Models to scan. Keep this to {"okuto"} for the primary
-  // Garfield/Silvaco comparison; add vodm/massey/grant only as needed.
   std::vector<std::string> models = {"okuto"};
 
-  // Adaptive stopping. Every mode runs at least minEvents and then stops
-  // when SEM / mean reaches targetRelativeSem, or at maxEvents.
+  // Stops when SEM/mean < targetRelativeSem, within [minEvents, maxEvents].
   int minEvents = 500;
   int maxEvents = 5000;
   int batchSize = 250;
@@ -576,19 +380,8 @@ struct FeedbackScanConfig {
   bool runPairSeed = true;
 };
 
-/* Impact-ionisation feedback scan.
-   Modes:
-   - e_no_holes: electron seed; generated holes counted but not transported
-   - e_full: electron seed; generated holes transported and multiplied
-   - h_full: hole seed; generated electrons transported
-   - eh_full: primary electron-hole pair with full feedback
-
-   Uses adaptive statistics, explicit heavy-tail/cap-limited statuses, and
-   writes feedback_results_v2.csv, feedback_summary_v2.csv, and the raw
-   per-mode avalanche-size text files.
-
-   Caller must restore si's configured MIP model afterward if a later MIP
-   pass is requested. */
+/* Feedback scan modes: e_no_holes, e_full, h_full, eh_full.
+   Caller must restore si's MIP model afterward. */
 void RunModelComparison(
     Garfield::AvalancheMC& avalLadder, Garfield::MediumSilicon& si,
     double x0, double yInj, double stepCm, std::size_t ladderCap,

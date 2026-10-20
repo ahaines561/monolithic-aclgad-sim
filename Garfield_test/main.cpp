@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -19,6 +20,7 @@
 #include "Garfield/Sensor.hh"
 #include "Garfield/SolidBox.hh"
 #include "Garfield/TrackHeed.hh"
+#include "Garfield/TrackBichsel.hh"
 
 #include "lgad_tools.hh"
 #include "sheet_weighting.hh"
@@ -179,6 +181,9 @@ static void DumpCombinedFieldProfile(
 }
 
 struct RunConfig {
+  // "diode" | "lgad" | "aclgad": sets .sta, readout layout and sheet model
+  // together. Override with --device.
+  std::string device = "aclgad";
   std::string file = "/home/ahaines561/HEP/MAS/Silvaco_dat/"
                         // "diode.sta";
                         // "lgad150V.sta";
@@ -189,83 +194,41 @@ struct RunConfig {
   std::string outDir = "output_files_aclgad_run/";
 
   double biasVOverride = std::numeric_limits<double>::quiet_NaN();
-  double xTrackUm = 250.;  // MIP track position
-  // Position scan
+  double xTrackUm = 250.;
   bool doPositionScan = false;
   double scanXStartUm = 0.;
   double scanXEndUm = 500.;
   double scanXStepUm = 20.;
   int scanMipsPerPoint = 3;
+  // Uniform random x instead of a grid (a grid aliases with the pad pitch).
+  bool scanRandomUniform = false;
+  int scanNRandomEvents = 200;
+  unsigned scanRandomSeed = 20260819u;
+  double scanCfdFraction = 0.2;
   bool scanUseGain = false;
-  /* Force serial transport during the scan. The scan visits positions where
-     Garfield emits DriftLine warnings frequently (device edges, the DC
-     contact, low-field gaps), and those warnings go to std::cerr. Serial
-     transport removes any concurrency on that path entirely. Costs speed;
-     leave false unless a crash recurs. */
+  // Serial transport during the scan; set only if a crash recurs.
   bool scanForceSerial = false;
   bool doWeightingDump = false;
-  /* Time-resolved dump of psi_k(x,y,t) for the resistive-sheet model, one grid
-    file per delayed time slice plus a summary trace. Cheap (seconds) and
-    independent of the MIP loop; use it to inspect the relaxation directly
-    rather than inferring it from waveforms. */
-  bool doDynamicWeightingDump = true; // dump the W(x,t) maps for all strips, one file per time slice
-  /* Resolution of that dump. Was hardcoded at 200 x 120, which is ~1.1 MB per
-     slice and 110 MB across the 99-slice production grid -- enough to be
-     annoying and still too coarse in y to see the field near the sheet. */
+  // psi_k(x,y,t) maps, one file per time slice
+  bool doDynamicWeightingDump = true;
   int weightingDumpNx = 200;
   int weightingDumpNy = 120;
-  /* Frame times for the dump, INDEPENDENT of resistiveWeightingTimesNs. Leave
-     empty to reuse the production grid.
-
-     Those two want different things. The production grid is placed to bound the
-     interpolation error in dpsi/dt (see the comment on it below), so it is
-     log-spaced and dense exactly where the waveform bends. A movie wants frames
-     spaced the way the eye reads them, and usually far fewer. Asking for times
-     off the production grid is legitimate: DelayedWeightingPotential
-     interpolates, so what you get is precisely what the signal sees.
-
-     For frames solved EXACTLY rather than interpolated, use
-     tools/weighting_movie, which drives SheetWeighting directly and needs
-     neither the TCAD load nor the MIP loop. */
+  // Dump frame times; empty = production grid. Off-grid times are interpolated.
   std::vector<double> weightingDumpTimesNs = {};
-  /* Stop after the dump instead of running transport. The dump costs seconds;
-     the MIP loop it currently sits in front of costs hours. */
   bool exitAfterWeightingDump = false;
-  /* Append psi for the DC contact and the backplane to the dump. They are not
-     readout electrodes and adding them creates no signal channel; they are the
-     other half of the picture, and their inclusion is what makes the per-frame
-     sum_psi_residual in the summary meaningful. Columns go on the END, so a
-     reader keyed on strip0/1/2 keeps working. */
+  // Append DC contact + backplane columns (needed for sum_psi_residual).
   bool weightingDumpIncludeDcBackplane = true;
-  bool doConvergenceScan = false; // legacy G_e/G_eh step ladder
-  bool doFeedbackScan = false; // explicit e_no_holes/e_full/h_full/eh_full
-  bool doModelComparison = false; // deprecated alias for doFeedbackScan
+  bool doConvergenceScan = false;
+  bool doFeedbackScan = false;
+  bool doModelComparison = false;  // deprecated alias for doFeedbackScan
   bool doMIP = true;
 
-  // Start small: the delayed-signal calculation costs roughly
-  // nSegments x nTimeBins per electrode (Sensor.cc:844-874), which is orders
-  // of magnitude more than a prompt-only run. Validate the waveform on a few
-  // events, then scale up.
-  /* One reference event is enough when the position scan is the deliverable:
-    it still yields an L_z measurement and a reference waveform. Each gain
-    event costs ~500 s at signalStepNs = 0.2. */
+  // Each gain event with delayed signal costs ~500 s.
   int nMips = 4;
 
-  /* MEASURE L_z FROM TRANSPORT.
-    ComponentPoisson2d needs charge per unit length in the unresolved z
-    direction, which until now was the hand-set scZExtentUm = 0.21 um --
-    chosen because it reproduced Silvaco's gain suppression, i.e. fitted to
-    the observable the screening model is meant to predict.
-    Garfield transports in full 3D even though the field is z-invariant, so
-    the real transverse spread is already in Point::z. This measures the
-    residence-time-weighted sigma_z and reports L_z = sqrt(12)*sigma_z.
-    Costs drift-line storage (memory), so it is opt-in. */
+  // Measure L_z from transport (replaces the fitted scZExtentUm).
   bool measureLz = true;
-  /* Restrict the measurement to a band around the gain layer. Screening only
-    matters where the carrier density is high AND the field is critical;
-    averaging over the whole 50 um bulk would be dominated by late holes that
-    have diffused far and contribute nothing to gain suppression.
-    Set both to 0 to use all depths (reported alongside, for comparison). */
+  // Gain-layer band for L_z; 0 = all depths.
   double lzBandHalfWidthUm = 2.5;
   int mipEventOffset = 0;
   bool mipRunStatic = true;
@@ -273,206 +236,87 @@ struct RunConfig {
   bool mipWriteOverlaySignals = true;
   bool mipWritePerEventSignals = false;
   bool mipWritePairFiles = false;
+  // Drift paths for tools/make_drift_gif.py (static pass, event 0 only).
+  bool mipWriteDriftLines = false;
+  long driftMaxCarriers = 300;
   bool mipWritePrimaries = false;
 
   int mipProgressEvery = 1;
   unsigned long mipPairProgressEvery = 0;
   int avalancheOmpChunk = 4;
-  // Outer OpenMP parallelism over primaries. Safe now that
-  // EnableMultithreading(1) pins Garfield's internal avalanche threading and
-  // the weighting model is immutable and shared by const pointer.
   bool mipForceSerialAvalanches = false;
   bool EnableDiffusion = true;
   bool EnableMultiplication = true;
-  // # repeated avalanches on a frozen field
-  // continuing Garfield random stream; no custom reseeding is performed.
+  // repeated avalanches on the frozen final field
   int mipFinalSampleCount = 0;
   bool mipFinalSampleEnableSignal = true;
 
   bool silenceGarfieldSensorSetup = true;
 
-  // Signal weighting model.
-  // false: static analytic strips (prompt-only LGAD reference).
-  // true: import prompt + time-dependent TCAD weighting potentials/fields.
+  // false: static analytic strips; true: imported TCAD dynamic weighting.
   bool useDynamicTcadWeighting = false;
   std::string weightingGridFile = "";
   std::string weightingBiasDataFile = "";
   double weightingDeltaV = 1.0;
-  // Use SetDynamicWeightingPotential for a voltage-step boundary condition
-  // (dv * Theta(t)); set false only for impulse-field maps (dv * delta(t)).
+  // true: voltage step dv*Theta(t); false: impulse-field maps dv*delta(t).
   bool dynamicWeightingUsesPotential = true;
   std::vector<double> delayedSignalTimesNs = {
       0., 0.02, 0.05, 0.1, 0.2, 0.5, 1., 2., 5., 10., 20., 50., 100.};
-  // One vector per readout strip, aligned with delayedSignalTimesNs.
+  // One vector per strip, aligned with delayedSignalTimesNs.
   std::vector<std::vector<std::string>> dynamicWeightingDataFiles;
   std::size_t delayedSignalAveragingOrder = 2;
 
-  /* Resistive-sheet weighting, solved in-process by sheet_weighting.hh.
-    This is the physically AC-coupled model: pads touch the n+ only through
-    C_ox and the only DC path is the bulk contact, so psi -> 0 and the induced charge integrates to zero on every pad -- the bipolar waveform
-    follows from the boundary conditions rather than being imposed. Set false for the prompt-only segmented-LGAD reference.
-    This is the physically AC-coupled configuration and the one that produces a bipolar waveform. It REQUIRES the exported weighting
-    tables; see the startup check below. To fall back to the prompt-onlly segmented-LGAD reference, set this to false. */
+  // Resistive-sheet (AC-coupled) weighting; gives the bipolar waveform.
+  // false = prompt-only segmented-LGAD reference.
   bool useResistiveGridWeighting = true;
-  /* Sheet parameters. R_sq is the one number not derivable from aclgad.sta:
-  the doping profile gives ~2740 ohm/sq at mu = 300, so record where 1500 comes from (measurement beats derivation, but it must be stated).
-  Derived from aclgad.sta: N_s = 7.58e12 cm^-2 of MOBILE electrons over the undepleted n+ (0 -> 0.43 um), uniform to ~1% across the active area, so
-    R_sq = 1/(q N_s mu_n) = 2740 ohm/sq at mu_n = 300 cm2/Vs.
-    mu = 250 -> 3290,  mu = 300 -> 2740,  mu = 350 -> 2350 ohm/sq. */
+  // From aclgad.sta: N_s = 7.58e12 cm^-2 -> 2740 ohm/sq at mu_n = 300.
+  // TODO: document the source of 1500.
   double sheetResistanceOhmSq = 1500.;
-  /* CONFIRMED silicon dioxide (2026-08-01). Every sheet time constant scales
-    linearly with this, so it is no longer a systematic. */
-  double couplingEpsR = 3.9;
+  double couplingEpsR = 3.9;  // SiO2, confirmed
   double couplingOxideThicknessUm = 0.1;
-  /* Grounded DC contact on the n+ (the `bulk` electrode in the .sta).
-
-    MEASURED 3.0 um, two independent ways from aclgad300V.sta: the `bulk`
-    region's nodes at y = 0 span exactly x = 0..3.0 um, and the coupling oxide
-    (region 2) begins at x = 3.0 um. The region spans 0..5 um in total, but the
-    rest is metal above the surface and does not hold the n+ at ground.
-
-    This was 5.0 until the cell-coverage fix in sheet_weighting.hh. Under the
-    old point test (is node x_i inside?) setting the true 3.0 collapsed the
-    contact to 1.667 um at nSheet = 301 -- worse than the wrong 5.0, which
-    happened to land exactly. With coverage weighting the represented contact
-    now converges to the true value:
-
-        dcX1 = 3.0 :  2.500 um (301) -> 2.917 (601) -> 3.056 (901)   -> 3.0
-        dcX1 = 5.0 :  4.167       -> 4.583       -> 4.722            -> 5.0
-
-    Still quantised to +-dx/2 because a hard Dirichlet has no fractional form;
-    exact sub-cell treatment needs the contact as a large finite conductance to
-    ground. See tools/README.md, "DC contact width". */
+  // Ohmic DC contact: 0..3.0 um, measured from aclgad300V.sta.
+  // Represented width is quantised to +-dx/2 (see tools/README.md).
   double dcContactX0Um = 0.;
   double dcContactX1Um = 3.0;
-  /* GROUNDED METAL ON THE OXIDE, part of the same `bulk` electrode but coupled
-     to the n+ capacitively rather than ohmically.
-
-     From the aclgad300V.sta boundary polygon: the electrode runs along y = 0
-     for x = 0..3 (ohmic, above), then steps up at x = 3 and continues right to
-     x = 5 with its underside at y = -0.100 -- the same height as metal1/2/3,
-     over the same 0.1 um oxide. It is a pad in everything but readout.
-
-     Omitting it removes a real drain path. It is why the isolating run found
-     that setting the correct ohmic 3.0 made agreement with Silvaco WORSE than
-     the wrong 5.0: grounding 0..5 um ohmically was the wrong mechanism, but it
-     did supply the sink that this region actually provides. */
+  // Grounded metal over oxide (rest of the `bulk` electrode): capacitive sink.
   std::vector<std::pair<double, double>> groundedPadsUm = {{3.0, 5.0}};
   std::size_t sheetNodes = 301;
   std::size_t sheetOutY = 81;
   std::size_t sheetStepsPerDecade = 60;
-  /* DELAYED WEIGHTING TIME GRID.
-
-    HARD CONSTRAINT: consecutive entries must be at least signalStepNs apart.
-    Sensor.cc:859-868 distributes each delayed increment across the signal
-    bins it spans using weights f = (t1 - t0)/dt, but t1 is initialised to the
-    BIN BOUNDARY and is only clamped to the actual end time on later loop
-    iterations. When two consecutive delayed times fall in the SAME signal
-    bin the loop executes once with f > 1 and the charge is over-counted:
-    for slices at 0.002 and 0.005 ns with a 0.2 ns bin, f = 66.
-    This inflates both lobes and wrecks the charge cancellation -- it is what
-    took net/|Q-| from ~0.5% to ~4%.
-
-    Cost is nSegments x nElectrodes x (t_max / signalStepNs) and is INDEPENDENT
-    of the number of slices, so pack them as densely as the constraint allows.
-    (That independence is only true because SheetWeighting::Delayed() brackets
-    the time by binary search; it was an O(n) scan until 2026-08-05.)
-
-    WHY THIS GRID IS DENSE. Delayed() interpolates psi LINEARLY in t, so
-    d(psi)/dt -- which IS the delayed induced current once the carriers have
-    been collected (~2.5 ns) -- is piecewise constant. A coarse grid therefore
-    turns the whole slow lobe into a staircase of flat plateaus with a jump at
-    every slice. Measured against a 180-point reference solve, the previous
-    29-slice grid mis-stated the delayed current by up to 18.6% of the peak
-    current; this grid holds it to 0.47%. The integral was always right (which
-    is why V3 never caught it), only the shape was wrong.
-
-    The slices are NOT hand-picked. They are placed greedily so that linear
-    interpolation of psi_k(x,y,t) stays within 0.3% of psi(0+) against that
-    reference solve, checked over 35 (electrode, x, y) probes spanning the pads,
-    the gaps and the full depth. Regenerate with scratchpad/psi_dump.cpp if
-    R_sq, t_ox or the pad layout changes -- the spacing tracks the sheet time
-    constant, so a different R_sq needs a different grid.
-
-    Last time = 200 ns, not 150. Delayed() clamps beyond the final slice, so
-    cutting early freezes a fraction of psi permanently and that frozen
-    remainder is exactly the residual non-cancellation in V3. Worst-probe
-    |psi(t_end)|/|psi(0+)|: 1.9e-4 at 150 ns, 4.7e-5 at 200 ns.
-
-    MEMORY: SheetWeighting stores nElectrodes x (nSlices+1) x nOutY x nSheet
-    doubles = ~98 MB for 99 slices at nOutY=81, nSheet=301. Budget for it. */
+  /* Delayed weighting time grid.
+     - Spacing must be >= signalStepNs: two slices in one bin over-count
+       charge (Sensor.cc:859-868).
+     - Placed greedily for <0.3% psi interpolation error; regenerate with
+       scratchpad/psi_dump.cpp if R_sq, t_ox or pad layout change.
+     - Ends at 200 ns: Delayed() clamps beyond the last slice.
+     - Memory ~98 MB at 99 slices, nOutY=81, nSheet=301. */
   std::vector<double> resistiveWeightingTimesNs = {
-      0.05, 0.104, 0.157, 0.213, 0.276, 0.339, 0.395, 0.461, 0.512, 0.567,
-      0.628, 0.697, 0.772, 0.856, 0.948, 0.999, 1.05,  1.11,  1.17,  1.23,
-      1.29,  1.36,  1.43,  1.51,  1.59,  1.67,  1.76,  1.85,  1.95,  2.05,
-      2.16,  2.27,  2.39,  2.52,  2.65,  2.79,  2.94,  3.1,   3.26,  3.43,
-      3.61,  3.81,  4.01,  4.22,  4.44,  4.67,  4.92,  5.18,  5.45,  5.74,
-      6.05,  6.37,  6.7,   7.06,  7.43,  8.23,  9.13,  9.61,  10.1,  10.6,
-      11.2,  11.8,  12.4,  13.1,  13.8,  14.5,  15.3,  16.1,  16.9,  17.8,
-      18.8,  19.7,  20.8,  21.9,  23.,   24.3,  25.5,  26.9,  28.3,  29.8,
-      31.4,  33.,   34.8,  36.6,  38.5,  40.6,  42.7,  45.,   47.4,  49.9,
-      52.5,  55.3,  58.2,  61.2,  67.9,  75.2,  87.8,  108.,  200.};
-  // Collect carriers at the depletion edge, not at the physical surface: the
-  // n+ above it is undepleted and conductive, so there is no drift field
-  // there and transporting through it is unphysical.
+      0.203, 0.416, 0.628, 0.856, 1.11, 1.36, 1.59, 1.85, 2.05, 2.27,
+      2.52, 2.79, 3.1, 3.43, 3.81, 4.01, 4.22, 4.44, 4.67, 4.92,
+      5.18, 5.45, 5.74, 6.05, 6.37, 6.7, 7.06, 7.43, 8.23, 9.13,
+      9.61, 10.1, 10.6, 11.2, 11.8, 12.4, 13.1, 13.8, 14.5, 15.3,
+      16.1, 16.9, 17.8, 18.8, 19.7, 20.8, 21.9, 23, 24.3, 25.5,
+      26.9, 28.3, 29.8, 31.4, 33, 34.8, 36.6, 38.5, 40.6, 42.7,
+      45, 47.4, 49.9, 52.5, 55.3, 58.2, 61.2, 67.9, 75.2, 87.8,
+      108, 200
+  };
+  // Collect at the depletion edge; the n+ above it is undepleted.
   double depletionEdgeUm = 0.430466;
 
   double staticSignalWindowNs = 4.;
-  // Must cover the last exported weighting-map time.
-  // The resistive tables run to 150 ns, by which point psi has relaxed to ~4e-4 of its prompt value, so the pad-charge cancellation is complete to that level.
-  /* Only needs to exceed the last weighting time plus the carrier drift
-    time. This does NOT drive the delayed cost -- the weighting range does. */
+  // Must exceed the last weighting time plus drift time.
   double dynamicSignalWindowNs = 210.;
-  /* CRITICAL FOR RUNTIME. The delayed accumulation walks the bin index from
-    the current drift time out to (t + t_max_delayed) for EVERY drift segment
-    of EVERY carrier (Sensor.cc:850-872), so cost is linear in 1/signalStepNs:
-    1050 bins per segment at 0.2 ns against 4200 at 0.05 ns.
-
-    0.05 ns, NOT 0.2. The earlier note here claimed 0.05 "buys nothing" because
-    the prompt lobe "peaks near 0.7 ns and crosses zero near 1.2 ns". The
-    Silvaco cross-check falsified both: measured on the 300 V AC-LGAD the hit
-    pad peaks at 0.52 +- 0.04 ns and crosses zero at 1.148 +- 0.018 ns, so a
-    0.2 ns bin puts only ~2.5 samples on the rising edge and quantises the
-    zero-crossing -- the two observables the Silvaco comparison turns on. It
-    also forbids resolving the psi overshoot (psi/psi(0+) peaks near 1.09 at
-    ~0.05 ns), which a 0.2 ns first slice cannot represent at all.
-
-    HARD LINK: this is the floor on the delayed weighting slice spacing, so
-    lowering it is what lets resistiveWeightingTimesNs be dense. The two must
-    be changed together; the start-up guard enforces the relation. */
-  double signalStepNs = 0.05;
+  // Delayed cost ~ 1/signalStepNs. Also the floor on weighting slice spacing.
+  double signalStepNs = 0.2;
 
   std::string model = "okuto";
   double temperatureK = 300.0;
-  /* PRIMARY IONISATION MODEL.  "heed" or "bichsel".
+  /* "heed" or "bichsel". They agree to 0.3% on mean pairs
+     (tools/ionisation_compare). Heed: matches arXiv:2505.05974, works in any
+     material. Bichsel: Si only, per-electron positions, needs upstream
+     TrackBichsel (2026-08-07). */
+  std::string ionisationModel = "heed";
 
-     heed     TrackHeed on the silicon medium. Works -- Heed handles solids via
-              SetupMaterial (TrackHeed.cc:778) -- but Heed is built for gases,
-              and every electron of a cluster is placed at the CLUSTER CENTROID,
-              because that is all the legacy GetCluster() iterator returns.
-
-     bichsel  TrackBichsel: differential cross-sections computed specifically
-              for silicon (H. Bichsel, Rev. Mod. Phys. 60 (1988) 663). This is
-              the reference model for energy-loss straggling in thin silicon and
-              is what Geant4's PAI model approximates.
-
-              Two-stage, per the upstream Examples/Bichsel: TrackBichsel gives
-              the ionising collisions and samples the subshell and the
-              relaxation cascade, producing ejected and Auger electrons at keV
-              energies. Those are NOT conduction-band pairs -- they must then be
-              transported by Heed's TransportDeltaElectron to reach the
-              conduction band. Skipping that second stage undercounts the pairs
-              by ~three orders of magnitude.
-
-              The two-stage path also gives each conduction electron its OWN
-              position, rather than collapsing a cluster onto its centroid.
-
-     Requires the TrackBichsel from garfieldpp upstream (merged 2026-08-07);
-     the older one has Cluster{x,y,z,t,energy} with no electrons and cannot be
-     used this way. */
-  std::string ionisationModel = "bichsel";
-
-  // Feedback-scan controls.
   std::vector<std::string> feedbackModels = {};  // empty = use cfg.model
   int feedbackMinEvents = 500;
   int feedbackMaxEvents = 5000;
@@ -486,43 +330,24 @@ struct RunConfig {
   bool dumpTownsendTables = true;
 
   unsigned int siliconRegion = 0;
-  bool assignAllRegionsToSilicon = false;  // diagnostic escape hatch only
-  double driftWindowNs = 4.; // carrier-transport window; independent of signal window
-  double fineStepNm = 75.; // step size inside the gain-layer band
-  double bulkStepNm = 800.;  /* step size everywhere else. Delayed cost is
-                             linear in the segment count and the bulk field is
-                             smooth, so a coarse step here is cheap accuracy.
-                             The fine step near the gain layer is unchanged. */
-  double fineBandHalfWidthUm = 2.5;  // band = [yGain-this, yGain+this]
+  bool assignAllRegionsToSilicon = false;  // diagnostic only
+  double driftWindowNs = 4.;
+  double fineStepNm = 75.;   // gain-layer band
+  double bulkStepNm = 800.;  // elsewhere
+  double fineBandHalfWidthUm = 2.5;
   double activeFieldMinVcm = 100.;
 
-  bool spaceCharge = true;  // master switch for the Poisson correction
-  /* L_z: the effective out-of-plane extent of the avalanche charge cloud.
-    ComponentPoisson2d is a 2D solver and wants charge per unit length in the
-    unresolved z direction, so the carrier count is divided by this width.
-    Screening scales as 1/L_z.
-
-    With useMeasuredLz = true this is OVERRIDDEN per event by the
-    residence-time-weighted sigma_z measured from the transported 3D
-    trajectories (L_z = sqrt(12)*sigma_z), and the value below is used only
-    as a fallback and for override runs.
-
-    The 0.21 um legacy value was fitted to reproduce a Silvaco gain
-    suppression. Measured values are ~4.7 um at 300 V and ~5.3 um at 230 V,
-    i.e. more than 20x larger, so the fitted number overstates screening by
-    that factor. Keep it available for reproducing old runs, not for physics. */
+  bool spaceCharge = true;
+  // Fallback L_z when useMeasuredLz is off. 0.21 was fitted; measured is ~5 um.
   double scZExtentUm = 0.21;
-  /* Use the transport-measured L_z for screening instead of scZExtentUm.
-    Requires measureLz and a static pass (the measurement is taken there,
-    in the unscreened field, before the screened iteration begins). */
+  // Requires measureLz and a static pass.
   bool useMeasuredLz = true;
   int scMaxIter = 16;
-  double scRelaxation = 0.25;     // damps stochastic avalanche forcing
+  double scRelaxation = 0.25;
   bool scWriteIterationHistory = false;
-  // 0 = quiet (only final per-event result), 1 = one line per iteration,
-  // 2 = detailed charge/field diagnostics.
+  // 0 quiet, 1 per iteration, 2 detailed
   int scConsoleVerbosity = 1;
-  double scGainTol = 0.01;  // diagnostic only; gain does not gate stopping
+  double scGainTol = 0.01;  // diagnostic only
   double scFieldTol = 0.01;
   int scStableIterations = 3;
   int scMixNx = 101;
@@ -534,8 +359,7 @@ struct RunConfig {
   bool scWriteFinalFieldProfile = false;
   int scFinalFieldProfilePoints = 801;
   bool scFinalEvaluationPass = true;
-  // Reuse the previous event's converged charge cloud as the initial guess,
-  // scaled by primary-pair count. The normal convergence test still applies.
+  // Seed each event with the previous converged charge, scaled by pair count.
   bool scWarmStartEvents = true;
   double scWarmStartScaleMin = 0.5;
   double scWarmStartScaleMax = 2.0;
@@ -546,23 +370,12 @@ int main(int argc, char** argv) {
   RunConfig cfg;
   const auto tRunStart = Clock::now();
 
-  /* Command-line overrides, deliberately limited to the weighting dump.
-     Everything else in RunConfig stays a recompile, because everything else is
-     a physics choice that ought to be recorded in the source and echoed into
-     mip_run_config. The dump is different: it is a viewing decision, it is
-     iterated on, and needing a five-minute rebuild to change a frame count is
-     the reason dumps end up at whatever resolution they were first written at.
-
-       ./main --dump-only                      dump and stop; seconds, not hours
-       ./main --dump-only --dump-nx 600 --dump-ny 400 --dump-frames 60
-       ./main --dump-only --dump-tmin 0.05 --dump-tmax 20 --out gifsrc/
-
-     Frames are log-spaced over [tmin, tmax] and clamped to the solved range,
-     so a request past the last solved slice returns the frozen final map
-     rather than extrapolating. */
+  // CLI covers run selection only; physics choices stay in RunConfig.
+  // Dump frames are log-spaced over [tmin, tmax], clamped to the solved range.
   {
     double tMin = 0., tMax = 0.;
     long frames = 0;
+    bool xTrackSetByUser = false;
     auto need = [&](int i, const char* what) {
       if (i + 1 >= argc) {
         std::cerr << what << " needs a value\n";
@@ -576,6 +389,11 @@ int main(int argc, char** argv) {
         std::cout <<
             "usage: main [--dump-only] [--dump-nx N] [--dump-ny N]\n"
             "            [--dump-frames N] [--dump-tmin ns] [--dump-tmax ns]\n"
+            "            [--scan-random N] [--scan-gain] [--no-mip]\n"
+            "            [--signal-step ns] [--device NAME] [--file PATH]\n"
+            "  --device: diode | lgad | lgad_djte | aclgad (default)\n"
+            "            [--x-track um] [--drift-lines] [--feedback-scan]\n"
+            "            [--n-mips N]\n"
             "            [--out DIR]\n"
             "With no arguments, runs the configured job as before.\n";
         return 0;
@@ -592,6 +410,49 @@ int main(int argc, char** argv) {
         tMin = std::stod(need(i, "--dump-tmin")); ++i;
       } else if (a == "--dump-tmax") {
         tMax = std::stod(need(i, "--dump-tmax")); ++i;
+      } else if (a == "--scan-random") {
+        cfg.doPositionScan = true;
+        cfg.scanRandomUniform = true;
+        cfg.scanNRandomEvents = std::stoi(need(i, "--scan-random")); ++i;
+      } else if (a == "--device") {
+        cfg.device = need(i, "--device"); ++i;
+        const std::string base = "/home/ahaines561/HEP/MAS/Silvaco_dat/";
+        if (cfg.device == "diode") {
+          cfg.file = base + "diode.sta";
+          cfg.useResistiveGridWeighting = false;
+        } else if (cfg.device == "lgad") {
+          cfg.file = base + "lgad180V.sta";
+          cfg.useResistiveGridWeighting = false;
+        } else if (cfg.device == "lgad_djte") {
+          cfg.file = base + "lgad_deepjte_180V_X80.sta";
+          cfg.useResistiveGridWeighting = false;
+        } else if (cfg.device == "aclgad") {
+          cfg.file = base + "aclgad300V.sta";
+          cfg.useResistiveGridWeighting = true;
+        } else {
+          std::cerr << "--device must be diode, lgad, lgad_djte or aclgad\n";
+          return 2;
+        }
+      } else if (a == "--n-mips") {
+        cfg.nMips = std::stoi(need(i, "--n-mips")); ++i;
+      } else if (a == "--feedback-scan") {
+        cfg.doFeedbackScan = true;
+        cfg.doMIP = false;
+      } else if (a == "--drift-lines") {
+        cfg.mipWriteDriftLines = true;
+        cfg.mipWritePairFiles = true;
+      } else if (a == "--x-track") {
+        cfg.xTrackUm = std::stod(need(i, "--x-track")); ++i;
+        xTrackSetByUser = true;
+      } else if (a == "--file") {
+        cfg.file = need(i, "--file"); ++i;
+      } else if (a == "--signal-step") {
+        // must be <= the delayed grid's min spacing (0.2 ns)
+        cfg.signalStepNs = std::stod(need(i, "--signal-step")); ++i;
+      } else if (a == "--scan-gain") {
+        cfg.scanUseGain = true;
+      } else if (a == "--no-mip") {
+        cfg.doMIP = false;
       } else if (a == "--out") {
         cfg.outDir = need(i, "--out"); ++i;
         if (cfg.outDir.back() != '/') cfg.outDir += '/';
@@ -600,6 +461,9 @@ int main(int argc, char** argv) {
         return 2;
       }
     }
+    // On the 100 um devices the default lands in the anode/cathode gap; use
+    // the anode centre.
+    if (!xTrackSetByUser && cfg.device != "aclgad") cfg.xTrackUm = 23.5;
     if (frames > 1 || tMin > 0. || tMax > 0.) {
       const auto& prod = cfg.resistiveWeightingTimesNs;
       if (prod.empty()) {
@@ -622,6 +486,38 @@ int main(int argc, char** argv) {
             tMin * std::pow(tMax / tMin, double(i) / double(frames - 1)));
       std::cout << "dump frames: " << frames << " log-spaced over " << tMin
                 << " .. " << tMax << " ns\n";
+    }
+  }
+
+  /* Two delayed slices in one signal bin over-count charge (Sensor.cc:859).
+     Checked before the sheet solve so a mismatch fails fast. To regenerate:
+       ./sheet_psi_dump 1500 0.1 > psi_dense.csv
+       python3 ../tools/sheet_grid_design.py psi_dense.csv --tol 0.01 \
+               --min-spacing <new signalStepNs> */
+  if (cfg.useResistiveGridWeighting) {
+    const auto& wt = cfg.resistiveWeightingTimesNs;
+    if (wt.empty() || wt.front() < cfg.signalStepNs - 1.e-12) {
+      std::cerr << "Delayed weighting grid must start at or after "
+                   "signalStepNs (" << cfg.signalStepNs << " ns); first slice "
+                   "is " << (wt.empty() ? 0. : wt.front()) << " ns.\n"
+                   "  Either lower signalStepNs or regenerate the grid with "
+                   "tools/sheet_grid_design.py --min-spacing "
+                << cfg.signalStepNs << "\n";
+      return 3;
+    }
+    double worst = 1e300;
+    std::size_t iw = 0;
+    for (std::size_t i = 1; i < wt.size(); ++i)
+      if (wt[i] - wt[i - 1] < worst) { worst = wt[i] - wt[i - 1]; iw = i; }
+    if (worst < cfg.signalStepNs - 1.e-12) {
+      std::cerr << "Delayed weighting times " << wt[iw - 1] << " and " << wt[iw]
+                << " ns are " << worst << " ns apart, closer than one signal "
+                   "bin (" << cfg.signalStepNs << " ns). Sensor would "
+                   "over-count the delayed charge.\n"
+                   "  Either set signalStepNs <= " << worst
+                << " or regenerate the grid with tools/sheet_grid_design.py "
+                   "--min-spacing " << cfg.signalStepNs << "\n";
+      return 3;
     }
   }
 
@@ -675,7 +571,6 @@ int main(int argc, char** argv) {
             << "] um, y = [" << by0 * 1.e4 << ", " << by1 * 1.e4
             << "] um" << std::endl;
 
-  // dump dead points in the map (mid-silicon gap); compare against regions
   ScanValidity(cmp, bx0, bx1, by0, by1, 400, 400,
               cfg.outDir + "validity_map.csv");
 
@@ -696,10 +591,7 @@ int main(int argc, char** argv) {
                                      cfg.activeFieldMinVcm);
   if (!prof.valid) return 1;
   const double yTop = prof.yTop;
-  /* Carriers are collected at the depletion edge. 
-  Above it the n+ is undepleted and conductive, so there is no drift field there and
-  transporting through it is unphysical. 
-  Derived from the .sta electron density by aclgad_extract.py, not assumed */
+  // depletion edge, from the .sta electron density (aclgad_extract.py)
   const double yCollect = std::max(yTop + 0.02e-4,
                                    cfg.depletionEdgeUm * 1.e-4);
   const double yBot = prof.yBot;
@@ -707,10 +599,7 @@ int main(int argc, char** argv) {
   const double yGain = prof.yGain;
   const double eMax = prof.eMax;
 
-  /* 2D search for a stronger field than the 1D probe line found. Seeded
-  with the probe line's own peak (not 0) so the line's result is a
-  valid answer if the grid search finds nothing better, and so the
-  "e > globalMaxField" check below is correct from the first iteration. */
+  // 2D hotspot search, seeded with the probe line's peak
   double globalMaxField = eMax;
   double globalMaxX = x0;
   double globalMaxY = yGain;
@@ -740,12 +629,12 @@ int main(int argc, char** argv) {
   std::cout << "[timer] hotspot scan: " << ElapsedS(tHotspotStart)
             << " s" << std::endl;
 
-  // field dump over x = xTrack +- 5 um, full depth, for offline plotting
+  // x = xTrack +- 5 um, full depth
   {
     const auto tDumpStart = Clock::now();
     const double xLo = std::max(bx0, (cfg.xTrackUm - 5.) * 1.e-4);
     const double xHi = std::min(bx1, (cfg.xTrackUm + 5.) * 1.e-4);
-    const double dxCm = 0.1e-4, dyCm = 0.05e-4;  // 0.1um cols, 0.05um rows
+    const double dxCm = 0.1e-4, dyCm = 0.05e-4;
     const int nx = static_cast<int>(std::round((xHi - xLo) / dxCm));
     const int ny = static_cast<int>(std::round((by1 - by0) / dyCm));
     const auto r = DumpElectricField(cmp, xLo, xHi, by0, by1, nx, ny,
@@ -769,27 +658,24 @@ int main(int argc, char** argv) {
               << " s" << std::endl;
   }
 
-  // strips canode/cathode
-  const std::vector<ReadoutStrip> strips = {
-    {"strip0",  50., 20.},
-    {"strip1", 245., 25.},
-    {"strip2", 450., 20.},
-  };
-  // const std::vector<ReadoutStrip> strips = {
-  //   {"anode",  22.5, 22.5},
-  //   {"cathode", 77.5, 22.5},
-  // };
+  // diode/LGAD: anode 0..47, cathode 53..100 um (from .sta)
+  const std::vector<ReadoutStrip> strips =
+      (cfg.device == "aclgad")
+          ? std::vector<ReadoutStrip>{{"strip0", 50., 20.},
+                                      {"strip1", 245., 25.},
+                                      {"strip2", 450., 20.}}
+          : std::vector<ReadoutStrip>{{"anode", 23.5, 23.5},
+                                      {"cathode", 76.5, 23.5}};
+  std::cout << "device = " << cfg.device << ", " << strips.size()
+            << " readout electrodes, resistive weighting "
+            << (cfg.useResistiveGridWeighting ? "ON" : "OFF") << "\n";
   if (!StripsInsideMap(strips, bx0, bx1)) return 1;
 
   ComponentAnalyticField analyticWeighting;
   ComponentTcad2d dynamicWeighting;
-  // ComponentUser keys its weighting functions by label, so one instance
-  // covers every pad.
   ComponentUser resistiveWeighting;
   std::unique_ptr<mass::SheetWeighting> sheetModel;
   Component* weightingCmp = nullptr;
-  // Empty unless the resistive-grid path is active, in which case it holds
-  // one component per strip, aligned with `strips`.
   std::vector<Component*> perStripWeighting;
   bool dynamicWeightingActive = false;
 
@@ -838,8 +724,6 @@ int main(int argc, char** argv) {
       }
     }
 
-    // Probe a quarter of the way into the bulk from the collecting surface:
-    // deep enough to be well inside the drift region, shallow enough that the weighting potential is still appreciable.
     const double wProbeY = yTop + 0.25 * (yBot - yTop);
     const auto validation =
         ValidateDelayedWeightingData(dynamicWeighting, strips, wProbeY);
@@ -854,8 +738,6 @@ int main(int argc, char** argv) {
               << validation.timesNs.size() << " time slices through "
               << validation.timesNs.back() << " ns\n";
   } else if (cfg.useResistiveGridWeighting) {
-    // Solve the resistive-sheet weighting problem in-process. No data files, no external tools: the bulk is a homogeneous slab with reflecting x
-    // boundaries, so its Dirichlet-to-Neumann map is diagonal in the cosine basis and the y dependence is analytic. See sheet_weighting.hh.
     mass::SheetConfig sc;
     sc.xMin = bx0;
     sc.xMax = bx1;
@@ -888,8 +770,7 @@ int main(int argc, char** argv) {
       return 3;
     }
 
-    // One ComponentUser serves every electrode: unlike ComponentGrid it key its weighting functions by label 
-    // The captured model is immutable and read only so the lambdas are safe to share across OpenMP workers
+    // model is immutable, so these lambdas are thread-safe
     const mass::SheetWeighting* model = sheetModel.get();
     for (std::size_t k = 0; k < strips.size(); ++k) {
       resistiveWeighting.SetWeightingPotential(
@@ -904,16 +785,7 @@ int main(int argc, char** argv) {
           },
           strips[k].label);
     }
-    /* Register the DC contact and the backplane too. These are NOT readout
-       electrodes -- Sensor::AddElectrode is called only over `strips`, so
-       naming them here adds no signal channel and changes no waveform. They
-       exist so the dump can show them.
-
-       Without them the dump is half a picture: psi_DC is where the sheet charge
-       actually drains, and sum_k psi_k = 1 over ALL electrodes is the only
-       check that the map on screen is self-consistent. Reading three strips
-       whose potentials sum to 0.6 and wondering where the rest went has cost
-       enough time already. */
+    // DC contact + backplane: dump only, not readout channels
     if (cfg.weightingDumpIncludeDcBackplane) {
       const std::size_t kDC = strips.size(), kBP = strips.size() + 1;
       for (auto kv : {std::make_pair(kDC, std::string("dc")),
@@ -932,26 +804,7 @@ int main(int argc, char** argv) {
             kv.second);
       }
     }
-    /* Enforce the Sensor.cc:859-868 spacing constraint before it can bite:
-      two delayed times inside one signal bin over-count the charge. */
     {
-      const auto& wt = cfg.resistiveWeightingTimesNs;
-      if (wt.empty() || wt.front() < cfg.signalStepNs - 1.e-12) {
-        std::cerr << "Delayed weighting grid must start at or after "
-                     "signalStepNs (" << cfg.signalStepNs << " ns); first "
-                     "slice is " << (wt.empty() ? 0. : wt.front()) << " ns.\n";
-        return 3;
-      }
-      for (std::size_t i = 1; i < wt.size(); ++i) {
-        if (wt[i] - wt[i - 1] < cfg.signalStepNs - 1.e-12) {
-          std::cerr << "Delayed weighting times " << wt[i - 1] << " and "
-                    << wt[i] << " ns are closer than one signal bin ("
-                    << cfg.signalStepNs << " ns). Sensor would over-count the "
-                       "delayed charge. Widen the spacing or reduce "
-                       "signalStepNs.\n";
-          return 3;
-        }
-      }
     }
     resistiveWeighting.SetDelayedSignalTimes(cfg.resistiveWeightingTimesNs);
     weightingCmp = &resistiveWeighting;
@@ -1009,8 +862,6 @@ int main(int argc, char** argv) {
   }
   const unsigned int signalBins = static_cast<unsigned int>(
       std::ceil(signalWindowNs / cfg.signalStepNs));
-  // Compare against whichever weighting time array is actually in use the
-  // resistive path does not populate delayedSignalTimesNs, so checking that array alone would silently pass a too-short window.
   const std::vector<double>& activeWeightingTimes =
       cfg.useResistiveGridWeighting ? cfg.resistiveWeightingTimesNs
                                     : cfg.delayedSignalTimesNs;
@@ -1025,8 +876,6 @@ int main(int argc, char** argv) {
 
   Sensor sensor;
   {
-    // Garfield prints electrode/time-window setup messages unconditionally
-    // to stdout. Silence only this setup block; stderr warnings remain live.
     std::ofstream nullOut;
     std::streambuf* oldCout = nullptr;
     if (cfg.silenceGarfieldSensorSetup) {
@@ -1060,17 +909,12 @@ int main(int argc, char** argv) {
                        cfg.outDir + "wfield_full.txt");
   }
 
-  const double fineStepCm = cfg.fineStepNm * 1.e-7;   // nm -> cm
+  const double fineStepCm = cfg.fineStepNm * 1.e-7;
   const double bulkStepCm = cfg.bulkStepNm * 1.e-7;
   const double fineBandCm = cfg.fineBandHalfWidthUm * 1.e-4;
-  // clamp to the active region -- yGain+-fineBandCm can extend past
-  // yTop/yBot when the gain layer sits close to an edge
   const double yFineLo = std::max(yGain - fineBandCm, yTop);
   const double yFineHi = std::min(yGain + fineBandCm, yBot);
 
-  // the MIP avalanche objects are created per-thread inside
-  // RunAvalanchePass; only the ladder (convergence / model comparison)
-  // needs a long-lived AvalancheMC here
   const std::size_t sizeCap = 5000;
 
   const double yInj = std::min(yGain + 5.e-4, 0.5 * (yGain + yBot));
@@ -1134,18 +978,20 @@ int main(int argc, char** argv) {
               << " fine=" << ladderFine.load() << " coarse="
               << ladderCoarse.load() << std::endl;
 
-    // RunModelComparison leaves si set to the last scanned model.
     if (!SetImpactIonisationModel(si, cfg.model)) return 2;
   }
 
-  if (!cfg.doMIP) {
+  // The position scan reuses the MIP setup below, so don't return early for it.
+  if (!cfg.doMIP && !cfg.doPositionScan) {
     std::cout << "doMIP=false -- diagnostics complete; skipping the MIP pass."
               << std::endl;
     return 0;
   }
+  const int nMipRun = cfg.doMIP ? cfg.nMips : 0;
+  if (!cfg.doMIP)
+    std::cout << "doMIP=false -- running the position scan only.\n";
 
-  // MIP ensemble
-  if (cfg.nMips <= 0) {
+  if (cfg.doMIP && cfg.nMips <= 0) {
     std::cerr << "nMips must be positive.\n";
     return 2;
   }
@@ -1182,20 +1028,30 @@ int main(int argc, char** argv) {
               << cfg.ionisationModel << "\"\n";
     return 1;
   }
-  TrackBichsel bichsel(&heedSensor);
+  // Lazily built: the constructor throws if GARFIELD_INSTALL is unset.
+  std::unique_ptr<TrackBichsel> bichselOwner;
   if (useBichsel) {
-    bichsel.SetParticle("pi");
-    bichsel.SetMomentum(180.e9);
-    if (!bichsel.Initialise() || !bichsel.ComputeCrossSection()) {
-      std::cerr << "TrackBichsel initialisation failed. It reads heps.tab from "
-                   "$GARFIELD_INSTALL/share/Garfield/Data -- is the environment "
-                   "set (source setupGarfield.sh)?\n";
+    try {
+      bichselOwner = std::make_unique<TrackBichsel>(&heedSensor);
+    } catch (const std::exception& e) {
+      std::cerr << "TrackBichsel could not be constructed: " << e.what()
+                << "\n  It reads heps.tab from $GARFIELD_INSTALL/share/Garfield"
+                   "/Data. Run\n    source "
+                   "$(dirname $(which garfield 2>/dev/null) 2>/dev/null)"
+                   "../share/Garfield/setupGarfield.sh\n  or set "
+                   "GARFIELD_INSTALL by hand, or use ionisationModel = "
+                   "\"heed\".\n";
       return 1;
     }
-    /* Heed is still needed, as the second stage: it transports the keV
-       electrons Bichsel ejects down to the conduction band. Initialise it
-       explicitly on the silicon, since we never call NewTrack on it in this
-       mode and the lazy path would not fire. */
+    auto& bichsel = *bichselOwner;
+    bichsel.SetParticle("pi");
+    bichsel.SetMomentum(180.e9);
+    if (!bichsel.ComputeCrossSection()) {
+      std::cerr << "TrackBichsel::ComputeCrossSection failed.\n";
+      return 1;
+    }
+    // Heed transports Bichsel's delta electrons; NewTrack is never called,
+    // so initialise explicitly.
     if (!track.Initialise(&si)) {
       std::cerr << "TrackHeed::Initialise(silicon) failed; cannot transport "
                    "the delta electrons Bichsel produces.\n";
@@ -1209,15 +1065,14 @@ int main(int argc, char** argv) {
     std::cout << "ionisation: TrackHeed on silicon\n";
   }
 
-  /* One generator for both call sites (the MIP loop and the position scan), so
-     the two cannot drift apart in which model they use. Fills `primaries` with
-     {x, y, z, t} per conduction electron and returns the cluster count. */
+  // Fills {x, y, z, t} per conduction electron; returns the cluster count.
   auto generatePrimaries =
       [&](const double xStartCm, const double yStartCm,
           std::vector<std::array<double, 4>>& primaries) -> unsigned long {
     primaries.clear();
     unsigned long nClusters = 0;
     if (useBichsel) {
+      auto& bichsel = *bichselOwner;
       bichsel.NewTrack(xStartCm, yStartCm, 0., 0., 0., 1., 0.);
       for (const auto& cluster : bichsel.GetClusters()) {
         ++nClusters;
@@ -1257,9 +1112,7 @@ int main(int argc, char** argv) {
   pc.forceSerial = cfg.mipForceSerialAvalanches;
   pc.enableDelayedSignal = dynamicWeightingActive;
   pc.requireDelayedWeightingData = true;
-  // Feed the array actually in use. In this Garfield build the value only reaches the truncation warning in RunAvalanchePass 
-  // Sensor stores its copy at Sensor.cc:758 and never reads it, all three accumulation loops taking cmp->DelayedSignalTimes(lbl) instead (Sensor.cc:838, 984, 1074)
-  // Passing the wrong array is therefore not a physics error here, but it would silence the one warning that catches a truncated slow lobe.
+  // Only used for the truncation warning; Sensor reads the component's times.
   pc.delayedSignalTimesNs =
       dynamicWeightingActive ? activeWeightingTimes : std::vector<double>{};
   pc.delayedSignalAveragingOrder = cfg.delayedSignalAveragingOrder;
@@ -1361,9 +1214,6 @@ int main(int argc, char** argv) {
                       "semChargeGainVsCanonicalOff,scField_Vcm\n";
   }
 
-  /* One row per event per iteration: lets the contraction ratio, Aitken
-     extrapolation and relaxation choice be evaluated per event instead
-     of inferred from a console log. */
   std::ofstream iterCsv;
   if (actuallyRunScreened && cfg.scWriteIterationHistory) {
     iterCsv.open(cfg.outDir + "mip_spacecharge_iterations" + mipSuffix
@@ -1412,6 +1262,7 @@ int main(int argc, char** argv) {
          << "\nscWarmStartScaleMax=" << cfg.scWarmStartScaleMax
          << "\nscPrintStageTimings=" << (cfg.scPrintStageTimings ? 1 : 0)
          << "\navalancheOmpChunk=" << cfg.avalancheOmpChunk
+         << "\nionisationModel=" << cfg.ionisationModel
          << "\nrngMode=continuousGarfieldStream"
          << "\nmipForceSerialAvalanches="
          << (cfg.mipForceSerialAvalanches ? 1 : 0)
@@ -1462,8 +1313,7 @@ int main(int argc, char** argv) {
          << "\ndriftWindowNs=" << cfg.driftWindowNs << "\n";
   }
 
-  // Wide overlay storage, matching the 1000MIPs.cpp layout:
-  // one column per MIP and one CSV per strip/pass.
+  // one column per MIP, one CSV per strip/pass
   std::vector<int> overlayEventIds;
   std::vector<unsigned long> overlayPrimaryCounts;
   std::vector<std::vector<std::vector<double>>> sigOffOverlay(strips.size());
@@ -1494,8 +1344,6 @@ int main(int argc, char** argv) {
     double elapsedS = 0.;
   };
 
-  /* L_z actually used by the most recent screened pass, in um. Declared out
-     here so writeModeRow can capture it; reassigned once per event. */
   double lzUsedUm = cfg.scZExtentUm;
   const auto writeModeRow = [&](const int eventId, const char* mode,
                                 const unsigned long nClusters,
@@ -1532,19 +1380,13 @@ int main(int argc, char** argv) {
   double previousConvergedLzUm = 0.;
   if (actuallyRunScreened) previousConvergedGrid.Init(scCfg);
 
-  for (int iMip = 0; iMip < cfg.nMips; ++iMip) {
+  for (int iMip = 0; iMip < nMipRun; ++iMip) {
     const int eventId = cfg.mipEventOffset + iMip;
     const auto tEventStart = Clock::now();
-    track.NewTrack(x0, yTop + 0.03e-4, 0., 0., 0., 1., 0.);
-    double xc = 0., yc = 0., zc = 0., tc = 0., ec = 0., extra = 0.;
-    int nc = 0;
-    unsigned long nPrimary = 0, nClusters = 0;
     std::vector<std::array<double, 4>> primaries;
-    while (track.GetCluster(xc, yc, zc, tc, nc, ec, extra)) {
-      ++nClusters;
-      nPrimary += nc;
-      for (int k = 0; k < nc; ++k) primaries.push_back({xc, yc, zc, tc});
-    }
+    const unsigned long nClusters =
+        generatePrimaries(x0, yTop + 0.03e-4, primaries);
+    const unsigned long nPrimary = primaries.size();
     if (cfg.mipWritePrimaries) {
       for (std::size_t ip = 0; ip < primaries.size(); ++ip) {
         const auto& p = primaries[ip];
@@ -1563,8 +1405,7 @@ int main(int argc, char** argv) {
 
     AvalanchePassConfig pcOff = pc;
     pcOff.multiplication = false;
-    // The gain-off pass is a prompt-normalisation baseline; it does not need
-    // the delayed AC response, and the delayed accumulation dominates runtime.
+    // prompt-only baseline; skips the costly delayed accumulation
     pcOff.enableDelayedSignal = false;
     std::vector<std::vector<double>> sigOff;
     std::vector<std::vector<double>> sigOffPrompt;
@@ -1655,9 +1496,7 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcSample, sampleSignal
       writeSampleSummary(mode, counting, charge, scFieldVcm);
     };
 
-    /* Per-event L_z measurement, filled by the static pass and consumed by
-       the screened pass below. Zero means "no valid measurement". */
-    double measuredLzUm = 0.;
+    double measuredLzUm = 0.;  // 0 = no valid measurement
     double measuredSigmaZUm = 0.;
     ModeResult staticResult;
     if (runStatic) {
@@ -1673,6 +1512,13 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcSample, sampleSignal
         pairs.open(path);
         pairs << "x_um,y_um,ne\n";
         pairPtr = &pairs;
+      }
+      std::ofstream driftFs;
+      if (cfg.mipWriteDriftLines && iMip == 0) {
+        driftFs.open(cfg.outDir + "driftlines" + mipSuffix + ".csv");
+        driftFs << "carrier,species,x_um,y_um,t_ns\n";
+        pcStatic.driftCsv = &driftFs;
+        pcStatic.driftMaxCarriers = cfg.driftMaxCarriers;
       }
       TransverseExtentAccumulator lzGain;
       staticResult.nTotal = RunAvalanchePass(
@@ -1710,9 +1556,7 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult
       staticResult.delayedMetrics =
           MeasureSignal(staticResult.delayedSignal, pc.tStart, pc.tStep);
       staticResult.countingGain = double(staticResult.nTotal) / nPrimary;
-      // Use the prompt absolute area for the signal-based gain diagnostic.
-      // A fully captured AC-coupled total waveform has nearly cancelling
-      // signed lobes, so its signed integral is not a gain estimator.
+      // prompt |area|: AC-coupled signed lobes cancel
       staticResult.chargeGain = offPromptMetrics.totalAbsoluteArea > 0.
           ? staticResult.promptMetrics.totalAbsoluteArea /
             offPromptMetrics.totalAbsoluteArea : 0.;
@@ -1730,10 +1574,6 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult
                             staticSampleCounting, staticSampleCharge, 0.);
     }
 
-    /* Apply the measured L_z to THIS event's screening. Poisson sees charge
-       per unit z, so this is the one place the measurement changes physics
-       rather than just being reported. Done per event because sigma_z
-       fluctuates a few percent with the Landau depth distribution. */
     lzUsedUm = cfg.scZExtentUm;
     if (cfg.useMeasuredLz && actuallyRunScreened) {
       if (measuredLzUm > 0.) {
@@ -1763,10 +1603,6 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult
       std::vector<std::vector<double>> sigIter;
       unsigned long nIterTotal = 0;
 
-      /* Spatial mixing grid. The blend must be on the charge DENSITY:
-         the cloud's shape changes between iterations, so rescaling a
-         scalar amplitude is not equivalent. Poisson is linear, so
-         blending rho is exactly blending the fields. */
       ChargeGrid mixed, fresh;
       mixed.Init(scCfg);
       fresh.Init(scCfg);
@@ -1775,11 +1611,7 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult
       if (cfg.scWarmStartEvents && havePreviousConvergedGrid &&
           previousConvergedPrimary > 0) {
         mixed = previousConvergedGrid;
-        /* The stored grid is a charge DENSITY, already divided by the L_z of
-           the event that produced it. With a per-event measured L_z that
-           differs by a few percent, scale by the L_z ratio as well as by the
-           pair count, or the warm start starts from a slightly wrong density.
-           Only a small correction, but it costs nothing to be right. */
+        // rho is per unit L_z, so rescale by the L_z ratio too
         const double lzScale = (previousConvergedLzUm > 0. && lzUsedUm > 0.)
             ? previousConvergedLzUm / lzUsedUm : 1.;
         const double rawScale = lzScale * static_cast<double>(nPrimary) /
@@ -1793,8 +1625,6 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult
         LoadChargeGrid(scField, mixed);
         if (scField.Solve()) {
           usedWarmStart = true;
-          // Compare the first new update against the warm-start field rather
-          // than discarding that useful first residual.
           fieldGridPrev = SampleScreeningFieldGrid(scField, scCfg);
           haveFieldGridPrev = true;
           if (cfg.scConsoleVerbosity >= 1) {
@@ -1814,11 +1644,8 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult
         }
       }
 
-      // Space-charge iterations use the ordinary stochastic Garfield stream.
       AvalanchePassConfig pcIter = pc;
-      // Intermediate signals are discarded. Disabling them avoids the
-      // weighting-field work and signal-bin accumulation on every iteration.
-      pcIter.enableSignal = false;
+      pcIter.enableSignal = false;  // intermediate signals are discarded
       bool haveConvergedIterationSignal = false;
       unsigned long convergedIterationTotal = 0;
       std::vector<std::vector<double>> convergedIterationSignal;
@@ -1830,9 +1657,7 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcStatic, staticResult
         }
         const auto inputFieldSample = SampleScreeningField(scField, scCfg);
         fresh.Clear();
-        // When the exact final evaluation is disabled, calculate a signal on
-        // the likely final iteration. If this iteration converges, that signal
-        // can be reused and one full avalanche pass is avoided.
+        // Without a final pass, record the signal on the likely last iteration.
         pcIter.enableSignal = !cfg.scFinalEvaluationPass &&
             !cfg.mipWritePairFiles &&
             stableCount >= std::max(0, scCfg.stableIterations - 1);
@@ -1875,9 +1700,7 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcIter, sigIter, nullp
             : std::numeric_limits<double>::quiet_NaN();
         const double dE = fieldChange.relativeL2;
 
-        // The screening field is the fixed-point state. Avalanche gain is
-        // branching-sensitive even for a reproducible stream, so dG remains
-        // a diagnostic but does not gate convergence.
+        // converge on the field; dG is too noisy to gate
         const bool stableNow = std::isfinite(dE) && dE < scCfg.fieldTol;
         stableCount = stableNow ? stableCount + 1 : 0;
 
@@ -1948,7 +1771,6 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcIter, sigIter, nullp
           haveConvergedIterationSignal) {
         screenedResult.nTotal = convergedIterationTotal;
         screenedResult.signal = std::move(convergedIterationSignal);
-        // In the analytic prompt-only mode, total == prompt and delayed == 0.
         screenedResult.promptSignal = screenedResult.signal;
         screenedResult.delayedSignal.assign(
             strips.size(), std::vector<double>(pc.nBins, 0.));
@@ -2152,7 +1974,6 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcFinal, screenedResul
   std::cout << "[timer] total run so far: " << ElapsedS(tRunStart)
             << " s\n";
 
-  // ---- position scan --------------------------------------------------
   if (cfg.doPositionScan) {
     const std::string scanPath =
         cfg.outDir + "position_scan" + mipSuffix + ".csv";
@@ -2162,38 +1983,42 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcFinal, screenedResul
     for (const auto& s2 : strips) fScan << "," << s2.label << "_charge_fC";
     for (const auto& s2 : strips) fScan << "," << s2.label << "_peakNorm";
     for (const auto& s2 : strips) fScan << "," << s2.label << "_chargeNorm";
-    fScan << "\n";
+    for (const auto& s2 : strips) fScan << "," << s2.label << "_tPeak_ns";
+    for (const auto& s2 : strips) fScan << "," << s2.label << "_tCfd_ns";
+    for (const auto& s2 : strips) fScan << "," << s2.label << "_qPrompt_fC";
+    fScan << ",x_reco_um,dx_um,tSeed_ns,seedStrip\n";
 
-    const int nPts = static_cast<int>(
-        std::floor((cfg.scanXEndUm - cfg.scanXStartUm) / cfg.scanXStepUm)) + 1;
-    std::cout << "\n=== position scan: " << nPts << " requested points x "
-              << cfg.scanMipsPerPoint << " events, gain "
+    const int nPts = cfg.scanRandomUniform
+        ? cfg.scanNRandomEvents
+        : static_cast<int>(std::floor((cfg.scanXEndUm - cfg.scanXStartUm) /
+                                      cfg.scanXStepUm)) + 1;
+    const int nPer = cfg.scanRandomUniform ? 1 : cfg.scanMipsPerPoint;
+    // separate stream so scan size doesn't shift the MIP sequence
+    std::mt19937_64 scanRng(cfg.scanRandomSeed);
+    std::uniform_real_distribution<double> scanX(cfg.scanXStartUm,
+                                                 cfg.scanXEndUm);
+    std::cout << "\n=== position scan: "
+              << (cfg.scanRandomUniform ? "UNIFORM RANDOM " : "grid ")
+              << nPts << (cfg.scanRandomUniform ? " throws" : " points")
+              << " x " << nPer << " events, gain "
               << (cfg.scanUseGain ? "ON" : "OFF") << " ===" << std::endl;
     const auto tScan = Clock::now();
     int nRun = 0;
 
     for (int ip = 0; ip < nPts; ++ip) {
-      const double xs = cfg.scanXStartUm + ip * cfg.scanXStepUm;
-      // Test the ACTUAL track position, not the requested x. The 0.13 um
-      // offset keeps the track off a mesh line; without this the endpoints
-      // x = 0 and x = xMax fail an exact comparison against the bounding box
-      // and are silently dropped -- including x = 0, which sits on the DC
-      // contact and is one of the more diagnostic points.
+      const double xs = cfg.scanRandomUniform
+          ? scanX(scanRng)
+          : cfg.scanXStartUm + ip * cfg.scanXStepUm;
+      // 0.13 um offset keeps the track off mesh lines
       const double xTrackCm = xs * 1.e-4 + 0.13e-4;
       if (xTrackCm <= bx0 || xTrackCm >= bx1) {
         std::cout << "  x = " << xs << " um lies outside the map; skipped\n";
         continue;
       }
-      for (int ie = 0; ie < cfg.scanMipsPerPoint; ++ie) {
-        track.NewTrack(xTrackCm, yTop + 0.03e-4, 0., 0., 0., 1., 0.);
-        double xc2 = 0., yc2 = 0., zc2 = 0., tc2 = 0., ec2 = 0., ex2 = 0.;
-        int nc2 = 0;
-        unsigned long nPrim = 0;
+      for (int ie = 0; ie < nPer; ++ie) {
         std::vector<std::array<double, 4>> prim;
-        while (track.GetCluster(xc2, yc2, zc2, tc2, nc2, ec2, ex2)) {
-          nPrim += nc2;
-          for (int k = 0; k < nc2; ++k) prim.push_back({xc2, yc2, zc2, tc2});
-        }
+        generatePrimaries(xTrackCm, yTop + 0.03e-4, prim);
+        const unsigned long nPrim = prim.size();
         if (nPrim == 0) continue;
 
         AvalanchePassConfig pcScan = pc;
@@ -2209,19 +2034,69 @@ cmp, *weightingCmp, perStripWeighting, strips, primaries, pcFinal, screenedResul
         const double norm = static_cast<double>(nPrim) * gain;
 
         std::vector<double> peak(strips.size(), 0.), chg(strips.size(), 0.);
+        std::vector<double> tPeak(strips.size(),
+                                  std::numeric_limits<double>::quiet_NaN());
+        std::vector<double> tCfd(strips.size(),
+                                 std::numeric_limits<double>::quiet_NaN());
         for (std::size_t k = 0; k < strips.size(); ++k) {
-          for (const double v : sig[k]) {
-            if (std::abs(v) > std::abs(peak[k])) peak[k] = v;
+          std::size_t iPeak = 0;
+          for (std::size_t b = 0; b < sig[k].size(); ++b) {
+            const double v = sig[k][b];
+            if (std::abs(v) > std::abs(peak[k])) { peak[k] = v; iPeak = b; }
             chg[k] += v * pc.tStep;
           }
+          if (peak[k] == 0.) continue;
+          tPeak[k] = pc.tStart + (iPeak + 0.5) * pc.tStep;
+          // CFD: walk back from the peak (forward scan hits crosstalk lobes)
+          const double thr = cfg.scanCfdFraction * peak[k];
+          for (std::size_t b = iPeak; b > 0; --b) {
+            const double y1 = sig[k][b], y0 = sig[k][b - 1];
+            if ((peak[k] > 0. && y0 < thr && y1 >= thr) ||
+                (peak[k] < 0. && y0 > thr && y1 <= thr)) {
+              const double f = (y1 == y0) ? 0. : (thr - y0) / (y1 - y0);
+              tCfd[k] = pc.tStart + (double(b) - 0.5 + f) * pc.tStep;
+              break;
+            }
+          }
         }
+        // Integrate to the first zero crossing after the peak; the full
+        // AC-coupled integral cancels.
+        std::vector<double> qPrompt(strips.size(), 0.);
+        for (std::size_t k = 0; k < strips.size(); ++k) {
+          if (peak[k] == 0.) continue;
+          const double sgn = peak[k] > 0. ? 1. : -1.;
+          for (std::size_t b = 0; b < sig[k].size(); ++b) {
+            if (sgn * sig[k][b] <= 0. && pc.tStart + b * pc.tStep >
+                (std::isnan(tPeak[k]) ? 0. : tPeak[k])) break;
+            qPrompt[k] += sig[k][b] * pc.tStep;
+          }
+        }
+        // centroid weighted by peak amplitude
+        double sw = 0., swx = 0.;
+        std::size_t seed = 0;
+        for (std::size_t k = 0; k < strips.size(); ++k) {
+          const double w = std::abs(peak[k]);
+          sw += w;
+          swx += w * strips[k].centerUm;
+          if (w > std::abs(peak[seed])) seed = k;
+        }
+        const double xReco = sw > 0.
+            ? swx / sw : std::numeric_limits<double>::quiet_NaN();
+
         fScan << xs << "," << ie << "," << nPrim << "," << gain;
         for (double v : peak) fScan << "," << v;
         for (double v : chg) fScan << "," << v;
         for (double v : peak) fScan << "," << v / norm;
         for (double v : chg) fScan << "," << v / norm;
-        fScan << "\n";
-        fScan.flush();   // an interrupted scan keeps everything up to here
+        for (double v : tPeak) fScan << "," << v;
+        for (double v : tCfd) fScan << "," << v;
+        for (double v : qPrompt) fScan << "," << v;
+        // Falls back to tPeak: without an amplifier model the seed strip
+        // rises as a step, so CFD is usually undefined.
+        const double tSeed = std::isnan(tCfd[seed]) ? tPeak[seed] : tCfd[seed];
+        fScan << "," << xReco << "," << (xReco - xs) << "," << tSeed
+              << "," << seed << "\n";
+        fScan.flush();
       }
       ++nRun;
       std::cout << "  x = " << xs << " um done (" << nRun << " points, "

@@ -1,44 +1,17 @@
 #ifndef SHEET_WEIGHTING_HH
 #define SHEET_WEIGHTING_HH
 
-// Dynamic weighting potentials for a strip AC-LGAD, computed in-process.
+// Dynamic weighting potentials for a strip AC-LGAD (header-only).
+// Unit voltage step on one electrode at t = 0:
 //
-// Header-only and dependency-free: no Eigen, no external solver, no data
-// files, no build-system changes. Include it and construct one object.
-// For a unit voltage step on one electrode at t = 0 we solve
+//   bulk :  Laplace(phi) = 0                          0 <= y <= d
+//   sheet:  d(sigma)/dt = (1/R_sq) d2u/dx2            y = 0
+//           sigma = eps_Si * (DtN u) + C_ox(x) * (u - V_pad(x))
 //
-//   bulk :  Laplace(phi) = 0        on 0 <= y <= d   (depleted, uniform eps)
-//   sheet:  d(sigma)/dt = (1/R_sq) d2u/dx2           at y = 0
-//
-// This is generally called a Robin boundary condition, 
-// or a mixed boundary condition where u(x, t) is the potential of the undepleted n+,
-// and sigma its free surface charge density
-//
-//   sigma = eps_Si * (DtN u)  +  C_ox(x) * (u - V_pad(x)).
-//
-// The bulk is a homogeneous slab with reflecting boundaries at x = 0 and
-// x = L and a grounded backplane at y = d, so its Dirichlet-to-Neumann map is
-// DIAGONAL in the cosine basis cos(k_m x), k_m = m*pi/L, with eigenvalues
-// k_m * coth(k_m d)  ->  1/d as k -> 0. That removes the bulk mesh entirely:
-// the y dependence is analytic,
-//
-//   phi_m(y) = u_m * sinh(k_m (d - y)) / sinh(k_m d),
-//
-// and the whole problem collapses to a dense n_x system on the sheet.
-//
-// Two limits fix the physics and are checked by SelfTest():
-//   t -> 0+   no lateral charge has moved, so sigma = 0 on every free sheet
-//             node. That is a Neumann condition: the n+ is electrostatically
-//             TRANSPARENT and does NOT sit at ground in the gaps.
-//   t -> inf  the sheet is tied through R to the grounded DC contact, so
-//             u -> 0, psi -> 0 everywhere, and the induced charge on every
-//             AC pad integrates to zero. That is the bipolar signal, and it
-//             follows from the boundary conditions rather than being imposed.
-//
-// Time integration is Crank-Nicolson on an internal logarithmic grid.
-// Backward Euler damps stiff modes only algebraically and grossly
-// overestimates the tail when the step is large; CN is second order and was
-// verified to converge from the opposite side to the same limit.
+// The slab's DtN map is diagonal in cos(k_m x), eigenvalue k_m coth(k_m d),
+// so phi_m(y) = u_m sinh(k_m (d - y)) / sinh(k_m d) and only the sheet is
+// solved. t -> 0+: sigma = 0 (n+ transparent); t -> inf: psi -> 0.
+// Crank-Nicolson on a log time grid.
 
 #include <algorithm>
 #include <cmath>
@@ -50,7 +23,7 @@
 
 namespace mass {
 
-// minimal dense linear algebra (partial-pivot LU)
+// dense partial-pivot LU
 class LU {
  public:
   LU() = default;
@@ -100,44 +73,30 @@ class LU {
   std::vector<std::size_t> m_piv;
 };
 
-// configuration
+// Lengths in cm; defaults from aclgad.sta.
 struct SheetConfig {
-  // Geometry, all in cm. Defaults are the values extracted from aclgad.sta.
   double xMin = 0.;
-  double xMax = 5.0e-2;          // 500 um
-  double ySheet = 0.430466e-4;   // depletion edge: top of the depleted bulk
-  double yBack = 5.0e-3;         // backplane, 50 um
-  double tOx = 1.0e-5;           // coupling dielectric, 100 nm
+  double xMax = 5.0e-2;
+  double ySheet = 0.430466e-4;   // depletion edge
+  double yBack = 5.0e-3;
+  double tOx = 1.0e-5;
 
   double epsSi = 11.9;
-  double epsOx = 3.9;            // 3.9 = SiO2, 7.5 = Si3N4. VERIFY THIS.
-  double rSheet = 1500.;         // ohm / square
+  double epsOx = 3.9;            // SiO2
+  double rSheet = 1500.;         // ohm/sq
 
-  // Pad footprints in cm, in the same order as the readout strips.
+  // same order as the readout strips
   std::vector<std::pair<double, double>> pads = {
       {30.0e-4, 70.0e-4}, {220.0e-4, 270.0e-4}, {430.0e-4, 470.0e-4}};
-  // Grounded DC contact on the n+ (the `bulk` electrode in the .sta).
-  // This is the OHMIC part only: where the metal actually meets the silicon.
+  // ohmic DC contact
   double dcX0 = 0.;
   double dcX1 = 3.0e-4;
 
-  /* Grounded metal sitting on the oxide, i.e. part of the same DC electrode but
-     coupled to the n+ CAPACITIVELY rather than ohmically.
-
-     In aclgad*.sta the `bulk` electrode spans x = 0..5 um, but only 0..3 um
-     reaches y = 0; the coupling oxide (region 2) begins at x = 3.0, so over
-     3..5 um the electrode is metal over 0.1 um of oxide -- a grounded pad in
-     everything but name. Leaving it out removes a real drain path: it is why
-     setting the correct ohmic dcX1 = 3.0 made agreement with Silvaco WORSE
-     than the wrong 5.0, which had been compensating by grounding the whole
-     span ohmically.
-
-     These regions contribute C_ox exactly like a pad, but are driven only when
-     solving for the DC electrode, never for a readout pad. */
+  // Grounded metal on oxide (DC electrode, capacitively coupled).
   std::vector<std::pair<double, double>> groundedPads = {{3.0e-4, 5.0e-4}};
 
-  std::size_t nSheet = 301;      // sheet nodes (and cosine modes)
-  std::size_t nOutY = 81;        // output grid in y
+  std::size_t nSheet = 301;      // sheet nodes = cosine modes
+  std::size_t nOutY = 81;
   std::size_t stepsPerDecade = 60;
   double tStartNs = 1.0e-4;
 
@@ -147,7 +106,6 @@ struct SheetConfig {
       100., 150.};
 };
 
-// solver
 class SheetWeighting {
  public:
   explicit SheetWeighting(const SheetConfig& cfg) : m_cfg(cfg) { Build(); }
@@ -155,15 +113,12 @@ class SheetWeighting {
   std::size_t NumElectrodes() const { return m_cfg.pads.size(); }
   const std::vector<double>& TimesNs() const { return m_cfg.timesNs; }
 
-  // Prompt weighting potential, psi_k(x, y, 0+).
+  // psi_k(x, y, 0+)
   double Prompt(std::size_t k, double x, double y) const {
     return Sample(m_psi[k], 0, x, y);
   }
 
-  // Delayed REMAINDER, psi_k(x, y, t) - psi_k(x, y, 0+). This is the quantity
-  // Garfield's delayed machinery expects: Sensor adds the prompt term and the
-  // delayed term, so storing psi(t) itself would double-count the prompt and
-  // break I_total = I_prompt + I_delayed.
+  // psi_k(t) - psi_k(0+): Garfield adds the prompt term itself.
   double Delayed(std::size_t k, double x, double y, double tNs) const {
     const auto& ts = m_cfg.timesNs;
     if (tNs <= ts.front()) {
@@ -172,12 +127,7 @@ class SheetWeighting {
     }
     if (tNs >= ts.back())
       return Sample(m_psi[k], ts.size(), x, y) - Sample(m_psi[k], 0, x, y);
-    /* Bracket tNs by binary search, not a linear scan. This is called once per
-       (drift segment x signal bin x electrode), so an O(n) scan would make the
-       delayed signal cost scale with the NUMBER OF TIME SLICES -- which is
-       exactly the thing the dense grid in main.cpp relies on being free.
-       Equivalent to the old loop: ts.front() < tNs < ts.back() here, so
-       lower_bound returns the smallest i >= 1 with ts[i] >= tNs. */
+    // binary search keeps cost independent of the slice count
     std::size_t i = static_cast<std::size_t>(
         std::lower_bound(ts.begin(), ts.end(), tNs) - ts.begin());
     i = std::max<std::size_t>(1, std::min(i, ts.size() - 1));
@@ -187,32 +137,9 @@ class SheetWeighting {
     return (1. - f) * a + f * b - Sample(m_psi[k], 0, x, y);
   }
 
-  /* Completeness: stepping every electrode together drives no current, so
-     phi == 1 and the weighting potentials of ALL electrodes (pads, DC contact,
-     backplane) must sum to exactly 1 at every (x, y, t).
-
-     READ THIS BEFORE TRUSTING THE NUMBER. This check is far weaker than it
-     looks, and it CANNOT detect a wrong R_sq or a wrong t_ox.
-
-     Summing over all electrodes drives u == 1 on every sheet node. A constant
-     excites only the m = 0 cosine mode, so every DtN eigenvalue k*coth(k*d)
-     with m > 0 drops out identically -- the sum never probes them. And the
-     sheet operator has zero row sums (A*1 == 0), so the Crank-Nicolson step
-     preserves u == 1 exactly for ANY dt, R_sq or C_ox. What survives is:
-     lam[0] = 1/d, the Dirichlet rows, and the backplane's linear y/d term.
-     That is all this test constrains.
-
-     Demonstrated, not argued: at R_sq = 1e6 ohm/sq and t_ox = 10 um -- both
-     absurd by two orders of magnitude -- completeness still passes at 1.9e-10.
-
-     The decay check below is also weak: it only asks that the sheet eventually
-     drains to the grounded contact, which any connected geometry does. At those
-     same absurd parameters it passed too (0.0019 .. 0.0134).
-
-     To actually constrain the sheet parameters you need an EXTERNAL reference.
-     The Silvaco transient does it: the bipolar lobe ratio discriminates
-     R_sq = 1500 ohm/sq (-2.2% vs Silvaco) from 2740 (-48%). See
-     tools/compare_silvaco_waveform.py. */
+  /* Completeness (sum psi = 1) and decay checks. Both pass for ANY R_sq or
+     t_ox, so they cannot validate sheet parameters; use
+     tools/compare_silvaco_waveform.py for that. */
   bool SelfTest(std::ostream& os = std::cout) const {
     bool ok = true;
     const std::size_t nt = m_cfg.timesNs.size() + 1;
@@ -244,7 +171,6 @@ class SheetWeighting {
   }
 
  private:
-  //construction 
   void Build() {
     const std::size_t n = m_cfg.nSheet;
     const double L = m_cfg.xMax - m_cfg.xMin;
@@ -262,20 +188,7 @@ class SheetWeighting {
     const double epsSi = eps0 * m_cfg.epsSi;
     const double cOxVal = eps0 * m_cfg.epsOx / m_cfg.tOx;
 
-    /* Per-node oxide capacitance and pad membership, by CELL COVERAGE.
-
-       The obvious implementation -- "is the node x_i inside the pad?" -- makes
-       the modelled device depend on the grid. Node i owns the cell
-       [x_i - dx/2, x_i + dx/2], so a pad edge landing on a node leaves that
-       cell half outside, yet a point test gives it the full C_ox. Each pad then
-       comes out one cell too wide: 41.67 um at nSheet = 301, 40.83 at 601,
-       40.56 at 901, against a true 40.00. Refining the grid does not merely
-       refine the discretisation, it narrows the pads and widens the gaps, which
-       is an O(dx) inconsistency in the PHYSICS and blocks grid convergence.
-
-       Area-weighting the edge cells fixes that: the effective width is exactly
-       40.000 um at every nSheet. The pad edge stays perfectly sharp -- only the
-       integration of the straddling cell changes. */
+    // C_ox weighted by cell coverage so pad widths are grid-independent.
     m_cOxVal = cOxVal;
     auto coverage = [&](std::size_t i, double a, double b) {
       const double lo = std::max(m_cfg.xMin, m_x[i] - 0.5 * m_dx);
@@ -294,10 +207,7 @@ class SheetWeighting {
         m_cOx[i] += cOxVal * f;
       }
 
-    /* Grounded metal on the oxide: same C_ox as a pad, but it belongs to the DC
-       electrode, so it loads every readout pad's weighting potential and is
-       driven only in the DC electrode's own solve. Keeping it out of m_padFrac
-       is what makes that distinction. */
+    // grounded metal: loads every pad, driven only in the DC solve
     m_dcFrac.assign(n, 0.);
     for (const auto& g : m_cfg.groundedPads)
       for (std::size_t i = 0; i < n; ++i) {
@@ -306,18 +216,11 @@ class SheetWeighting {
         m_cOx[i] += cOxVal * f;
       }
 
-    /* The DC contact is a hard Dirichlet constraint and has no fractional form:
-       a node is pinned or it is not. Taking the cell when it is MORE THAN HALF
-       covered at least makes the represented contact the nearest multiple of dx
-       rather than always the one below, which halves the error and removes the
-       bias. Exact sub-cell treatment needs the contact modelled as a large
-       finite conductance to ground instead; see tools/README.md. */
+    // Dirichlet has no fractional form: pin cells > half covered.
     m_isDC.assign(n, 0);
     for (std::size_t i = 0; i < n; ++i)
       if (coverage(i, m_cfg.dcX0, m_cfg.dcX1) > 0.5) m_isDC[i] = 1;
 
-    // Cosine basis: reflecting in x at both ends, so cos(k_m x) with
-    // k_m = m*pi/L diagonalises the bulk.
     m_k.resize(n);
     m_decay.assign(n * m_cfg.nOutY, 0.);
     std::vector<double> C(n * n);
@@ -325,20 +228,19 @@ class SheetWeighting {
       m_k[m] = M_PI * static_cast<double>(m) / L;
       for (std::size_t i = 0; i < n; ++i)
         C[m * n + i] = std::cos(m_k[m] * (m_x[i] - m_cfg.xMin));
-      // Analytic y profile of this mode, sinh(k(d-y))/sinh(kd).
       for (std::size_t j = 0; j < m_cfg.nOutY; ++j) {
         const double yy = m_y[j] - m_cfg.ySheet;
         m_decay[m * m_cfg.nOutY + j] = ModeProfile(m_k[m], d, yy);
       }
     }
-    // Cinv maps nodal values -> modal amplitudes.
+    // Cinv: nodal -> modal
     std::vector<double> Ct(n * n);
     for (std::size_t i = 0; i < n; ++i)
       for (std::size_t m = 0; m < n; ++m) Ct[i * n + m] = C[m * n + i];
     m_Cinv = Invert(Ct, n);
     m_C = std::move(Ct);   // now nodal[i] = sum_m C[i*n+m] * modal[m]
 
-    // Dirichlet-to-Neumann: diagonal eigenvalue k coth(kd), -> 1/d as k -> 0.
+    // DtN eigenvalues k coth(kd) -> 1/d as k -> 0
     std::vector<double> lam(n);
     for (std::size_t m = 0; m < n; ++m) {
       const double kd = m_k[m] * d;
@@ -347,7 +249,7 @@ class SheetWeighting {
                                  std::sinh(std::min(kd, 700.));
       if (kd > 700.) lam[m] = m_k[m];
     }
-    // B = epsSi * C * diag(lam) * Cinv, dense.
+    // B = epsSi * C * diag(lam) * Cinv
     m_B.assign(n * n, 0.);
     for (std::size_t i = 0; i < n; ++i)
       for (std::size_t m = 0; m < n; ++m) {
@@ -357,7 +259,7 @@ class SheetWeighting {
           m_B[i * n + j] += w * m_Cinv[m * n + j];
       }
 
-    // Sheet conductance operator, conservative form, reflecting at the edges.
+    // sheet conductance, reflecting edges
     m_A.assign(n * n, 0.);
     const double g = 1.0 / (m_cfg.rSheet * m_dx * m_dx);
     for (std::size_t i = 0; i < n; ++i) {
@@ -393,8 +295,7 @@ class SheetWeighting {
 
   void Solve() {
     const std::size_t n = m_cfg.nSheet;
-    // Electrodes: pads, then the DC contact, then the backplane. The last two
-    // are solved only so SelfTest can check completeness.
+    // electrodes: pads..., DC contact, backplane
     const std::size_t nEl = m_cfg.pads.size() + 2;
     m_psi.assign(nEl, std::vector<double>((m_cfg.timesNs.size() + 1) *
                                           m_cfg.nOutY * n, 0.));
@@ -405,14 +306,9 @@ class SheetWeighting {
     for (std::size_t k = 0; k < nEl; ++k) {
       const bool isDCel = (k == m_cfg.pads.size());
       const bool isBP = (k == m_cfg.pads.size() + 1);
-      /* Drive from THIS electrode: the oxide capacitance of the part of each
-         cell lying under pad k, not the cell's total C_ox. For an interior cell
-         these agree; for a cell straddling a pad edge the drive is the covered
-         fraction, which is what keeps the effective pad width grid-independent. */
+      // drive = C_ox of the cell fraction under this electrode
       std::vector<double> cOxDrive(n, 0.);
       if (isDCel) {
-        // The DC electrode drives its capacitive extension as well as its
-        // ohmic contact; without this the electrodes no longer sum to unity.
         for (std::size_t i = 0; i < n; ++i)
           cOxDrive[i] = m_cOxVal * m_dcFrac[i];
       } else if (!isBP) {
@@ -422,24 +318,20 @@ class SheetWeighting {
       const double vDC = isDCel ? 1. : 0.;
       const double vBP = isBP ? 1. : 0.;
 
-      // t = 0+ : sigma = 0 on every free node  ->  (B + C_ox) u = C_ox V_pad,
-      // with the backplane offset folded in as a uniform shift.
+      // t = 0+: sigma = 0  ->  (B + C_ox) u = C_ox V_pad + eps V_bp / d
       std::vector<double> M(m_B);
       std::vector<double> rhs(n);
       const double dSlab = m_cfg.yBack - m_cfg.ySheet;
       const double eps0b = 8.8541878128e-14;
       for (std::size_t i = 0; i < n; ++i) {
         M[i * n + i] += m_cOx[i];
-        // sigma = eps*(DtN u) - eps*V_bp/d + C_ox*(u - V_pad); setting
-        // sigma = 0 puts both drives on the right-hand side.
         rhs[i] = cOxDrive[i] + eps0b * m_cfg.epsSi * vBP / dSlab;
       }
       ApplyDirichlet(M, rhs, vDC, n);
       std::vector<double> u = LU(M, n).Solve(rhs);
       Store(k, 0, u, vBP);
 
-      // Crank-Nicolson: d(sigma)/dt = A u, sigma = (B + C_ox) u - C_ox V_pad,
-      // and the drive is constant for t > 0 so it cancels in the difference.
+      // Crank-Nicolson on d(sigma)/dt = A u (constant drive cancels)
       std::size_t out = 1;
       double tPrev = 0.;
       for (double t : grid) {
@@ -496,13 +388,12 @@ class SheetWeighting {
     }
   }
 
-  // Reconstruct psi(x, y) from the sheet potential using the analytic mode
-  // profiles, and add the backplane's linear contribution.
+  // psi(x, y) from the sheet potential + backplane linear term
   void Store(std::size_t k, std::size_t it, const std::vector<double>& u,
              double vBP) {
     const std::size_t n = m_cfg.nSheet;
     const double d = m_cfg.yBack - m_cfg.ySheet;
-    const std::vector<double>& uu = u;   // w(sheet) = u by construction
+    const std::vector<double>& uu = u;
     std::vector<double> mod(n, 0.);
     for (std::size_t m = 0; m < n; ++m) {
       double s = 0.;
@@ -553,9 +444,9 @@ class SheetWeighting {
   SheetConfig m_cfg;
   double m_dx = 0.;
   std::vector<double> m_x, m_y, m_k, m_cOx;
-  std::vector<std::vector<double>> m_padFrac;  // [pad][node] cell coverage
-  std::vector<double> m_dcFrac;               // grounded-metal coverage, DC el.
-  double m_cOxVal = 0.;                       // C_ox per unit area, full cell
+  std::vector<std::vector<double>> m_padFrac;  // [pad][node] coverage
+  std::vector<double> m_dcFrac;
+  double m_cOxVal = 0.;
   std::vector<char> m_isDC;
   std::vector<double> m_B, m_A, m_C, m_Cinv, m_decay;
   std::vector<std::vector<double>> m_psi;

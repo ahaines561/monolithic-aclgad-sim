@@ -131,11 +131,7 @@ void ScanValidity(Component& cmp, double x0, double x1, double y0,
   std::ofstream fvalid(csvPath);
   fvalid << "x_um,y_um,status\n";
   std::size_t nInvalid = 0, nScanned = 0;
-  // nudge off exact mesh coordinates: a point landing exactly on a node
-  // or element edge belongs to neither adjoining element under strict
-  // inequality tests, so lookup fails and the point reads as invalid even
-  // where the region is perfectly good. DumpElectricField carries the
-  // same eps for the same reason.
+  // eps: points exactly on mesh edges fail element lookup
   for (int ix = 0; ix <= nx; ++ix) {
     const double x = x0 + (x1 - x0) * ix / nx + eps;
     for (int iy = 0; iy <= ny; ++iy) {
@@ -155,11 +151,6 @@ void ScanValidity(Component& cmp, double x0, double x1, double y0,
             << std::endl;
 }
 
-/* 1D scan at x0 from y0 to y1: finds the active-silicon bounds and the
-gain-layer peak, writes the profile to a text file. Prints its own
-diagnostics (active silicon bounds, peak field, low-field NOTE, or the
-"no valid drift medium" error if !valid).*/
-
 FieldProfile ScanFieldProfile(Component& cmp, double x0, double y0,
                               double y1, int nScan,
                               const std::string& csvPath,
@@ -167,8 +158,7 @@ FieldProfile ScanFieldProfile(Component& cmp, double x0, double y0,
   FieldProfile prof;
   std::ofstream fprof(csvPath);
   fprof << "y_um,V,Ex_Vcm,Ey_Vcm,Emag_Vcm\n";
-  // sentinel-swap: yTop starts above yBot so "yTop > yBot" doubles as a
-  // "first valid point found yet?" flag; see main.cpp's original comment.
+  // yTop > yBot means "no valid point yet"
   double yTop = 1., yBot = -1.;
   std::size_t nDead = 0;
   for (int i = 0; i <= nScan; ++i) {
@@ -177,10 +167,7 @@ FieldProfile ScanFieldProfile(Component& cmp, double x0, double y0,
     cmp.ElectricField(x0, y, 0., ex, ey, ez, v, m, st);
     if (st != 0) continue;
     const double e = std::sqrt(ex * ex + ey * ey);
-    // still dumped for diagnostics, but excluded from the active bounds:
-    // carriers in a valid-but-fieldless region (undepleted top layer)
-    // have no drift velocity, cannot leave, and burn the whole time
-    // window in tiny steps -- the dominant runtime cost when included.
+    // Fieldless (undepleted) points are excluded: carriers there stall.
     if (e < eMinVcm) { ++nDead; }
     else {
       if (yTop > yBot) yTop = y;
@@ -217,10 +204,6 @@ FieldProfile ScanFieldProfile(Component& cmp, double x0, double y0,
   return prof;
 }
 
-/* E-field over an nx*ny grid spanning [x0,x1]x[y0,y1], to a text file:
-x_um,y_um,Ex_Vcm,Ey_Vcm,Emag_Vcm,V. 
-
-Does not print -- callers want different summary lines (window vs full-device); use the returned result to print. */
 FieldDumpResult DumpElectricField(Component& cmp, double x0, double x1,
                                   double y0, double y1, int nx, int ny,
                                   const std::string& csvPath, double eps) {
@@ -244,17 +227,10 @@ FieldDumpResult DumpElectricField(Component& cmp, double x0, double x1,
   return r;
 }
 
-/* weighting field
-- per-strip Ew/wpot startup check (probed just inside the gap) 
--plus an overlap sanity check under strip0. Pure diagnostic printing. */
 void PrintWeightingSanity(Component& wcmp,
                           const std::vector<ReadoutStrip>& strips, double yTop,
                           double yCollectHint, double yBot) {
-  /* yTop is the physical silicon surface, but in the AC-coupled model the
-    weighting potential only exists from the DEPLETION EDGE downwards: above
-    it the n+ is undepleted and conductive, so there is nothing to report and
-    a query there returns 0, which looks like a failure. Use the shallowest
-    point that is actually inside the drift region. */
+  // Weighting potential starts at the depletion edge, not the surface.
   const double yShallow = std::max(yTop + 0.01e-4, yCollectHint);
   for (const auto& s : strips) {
     const double xc = s.centerUm * 1.e-4, yMid = 0.5 * (yTop + yBot);
@@ -269,30 +245,18 @@ void PrintWeightingSanity(Component& wcmp,
               << std::endl;
   }
   if (strips.empty()) return;
-  // sum every strip's potential AT strip[0]'s own location -- generalises
-  // the original's hardcoded strip0/1/2 sum to however many strips there are
   double sumAtFirst = 0.;
   for (const auto& s : strips) {
     sumAtFirst += wcmp.WeightingPotential(strips[0].centerUm * 1.e-4,
                                           yShallow, 0., s.label);
   }
-  /* For DC-coupled strips tiling a continuous grounded plane this sum is 1
-    by completeness. For AC-coupled pads it is the local capacitive divider
-    C_ox/(C_ox + C_bulk) ~ 0.99; the remainder belongs to the DC contact and
-    the backplane, which are separate electrodes. True completeness over ALL
-    electrodes is what the sheet solver self-test checks. */
+  // AC-coupled: ~C_ox/(C_ox+C_bulk); the rest is on DC contact + backplane.
   std::cout << "sum of weighting potentials at y=" << yShallow * 1.e4
             << " um under " << strips[0].label << "'s centre = " << sumAtFirst
             << "  [expect ~1 DC-coupled, ~0.99 AC-coupled]" << std::endl;
 }
 
-/* Avalanche Stepping
-- step function (fine band around gain layer, coarse elsewhere)
-- size cap
-- time window
-- stepCm captured by ref so RunConvergenceScan can tune it
-- no `static` counters in the step lambda -- called twice (aval,
-  avalLadder), so statics would be shared across both closures */
+// stepCm captured by ref so RunConvergenceScan can tune it.
 void ConfigureAvalanche(AvalancheMC& av, double& stepCm, double bulkStepCm,
                         double yFineLoCm, double yFineHiCm,
                         double timeWindowNs, std::size_t sizeCap,
@@ -302,18 +266,9 @@ void ConfigureAvalanche(AvalancheMC& av, double& stepCm, double bulkStepCm,
                         std::atomic<long long>& nFine,
                         std::atomic<long long>& nCoarse,
                         std::atomic<long long>& nPrinted) {
-  // AvalancheMC has no DisableMultithreading(). The only entry point is
-  // EnableMultithreading(unsigned nThreads = 0), and nThreads < 1 is
-  // interpreted as "use hardware_concurrency()" (AvalancheMC.cc:1994).
-  // Passing a bool therefore requested MAXIMUM threading, not none.
-  // m_nThreads defaults to 1 (AvalancheMC.hh:347), so 1 == serial.
+  // 0 = hardware_concurrency, 1 = serial
   av.EnableMultithreading(enableMultithreading ? 0u : 1u);
-  // Pin the signal path. m_useWeightingPotential defaults to true
-  // (AvalancheMC.hh:317), but the choice must match which weighting store is
-  // actually populated: the potential path calls WeightingPotential() and
-  // DelayedWeightingPotentials(); the field path calls WeightingField() and
-  // DelayedWeightingField(). A mismatch is either an out-of-bounds read or a
-  // silently-zero delayed signal, so do not rely on the default.
+  // Must match the populated delayed store, else the delayed signal is 0.
   av.UseWeightingPotential(true);
   av.EnableSignalCalculation(enableSignal);
   av.SetTimeWindow(0., timeWindowNs);
@@ -334,9 +289,7 @@ void ConfigureAvalanche(AvalancheMC& av, double& stepCm, double bulkStepCm,
 }
 
 namespace {
-// Production avalanche configuration. Unlike ConfigureAvalanche, this
-// callback performs no atomic diagnostics on every drift step. The
-// instrumented version remains available for convergence/feedback scans.
+// ConfigureAvalanche without per-step atomic counters.
 void ConfigureAvalancheFast(AvalancheMC& av, const double fineStepCm,
                             const double bulkStepCm,
                             const double yFineLoCm,
@@ -344,9 +297,7 @@ void ConfigureAvalancheFast(AvalancheMC& av, const double fineStepCm,
                             const double timeWindowNs,
                             const std::size_t sizeCap,
                             const bool enableSignal) {
-  // See ConfigureAvalanche: DisableMultithreading() does not exist; 1 thread
-  // is serial, 0 would request hardware_concurrency(). Outer OpenMP
-  // parallelism over primaries must not nest with Garfield's internal threads.
+  // serial: don't nest inside the OpenMP loop
   av.EnableMultithreading(1u);
   av.UseWeightingPotential(true);
   av.EnableSignalCalculation(enableSignal);
@@ -361,8 +312,6 @@ void ConfigureAvalancheFast(AvalancheMC& av, const double fineStepCm,
 }
 }  // namespace
 
-// per-strip weighting potential over a grid, to a text file:
-// x_um,y_um,<label>_phi,...
 void DumpWeightingField(Component& wcmp,
                         const std::vector<ReadoutStrip>& strips, double bx0,
                         double bx1, double yTop, double yBot,
@@ -397,20 +346,14 @@ void DumpDynamicWeighting(Component& wcmp,
                           const int ny,
                           const std::vector<std::string>& extraLabels) {
   const auto tStart = Clock::now();
-  // Probe point: mid-depth under the first strip, for the summary trace.
   const double xProbe = strips.empty() ? 0.5 * (bx0 + bx1)
                                        : strips.front().centerUm * 1.e-4;
   const double yProbe = 0.5 * (yLo + yHi);
 
-  /* Readout strips first, then any extras (the DC contact and the backplane).
-     Keeping that order means a reader keyed on the strip columns is unaffected
-     by whether the extras are present. */
   std::vector<std::string> labels;
   for (const auto& s : strips) labels.push_back(s.label);
   for (const auto& l : extraLabels) labels.push_back(l);
-  /* sum_k psi_k == 1 holds only over EVERY electrode, so the residual is
-     meaningful only when the extras are present. Reported as -1 otherwise
-     rather than as a misleadingly large number. */
+  // sum psi = 1 only over all electrodes; residual is -1 otherwise
   const bool complete = !extraLabels.empty();
 
   std::ofstream fs(outPrefix + "_summary.csv");
@@ -419,7 +362,7 @@ void DumpDynamicWeighting(Component& wcmp,
   for (const auto& l : labels) fs << "," << l << "_psiProbe";
   fs << ",sum_psi_residual\n";
 
-  // Index -1 denotes the prompt map; >= 0 indexes timesNs.
+  // it = -1: prompt map
   for (int it = -1; it < static_cast<int>(timesNs.size()); ++it) {
     const double t = it < 0 ? 0. : timesNs[it];
     std::ostringstream fn;
@@ -439,7 +382,6 @@ void DumpDynamicWeighting(Component& wcmp,
         fw << x * 1.e4 << "," << y * 1.e4;
         double sum = 0.;
         for (std::size_t k = 0; k < labels.size(); ++k) {
-          // Prompt plus delayed remainder = the potential the signal sees.
           double psi = wcmp.WeightingPotential(x, y, 0., labels[k]);
           if (it >= 0) {
             psi += wcmp.DelayedWeightingPotential(x, y, 0., t, labels[k]);
@@ -515,18 +457,8 @@ DelayedWeightingValidation ValidateDelayedWeightingData(
     }
   }
 
-  // ---------------------------------------------------------------------
-  // Live probe of the store the signal path will actually read.
-  //
-  // The checks above only inspect DelayedSignalTimes(), which is NOT
-  // sufficient: ComponentTcadBase::DelayedSignalTimes falls back from the
-  // potential store (m_dwtp) to the field store (m_dwtf), so it returns a
-  // non-empty grid in BOTH mismatch directions. We use the weighting-potential
-  // signal path (AvalancheMC::UseWeightingPotential(true)), which consumes
-  // WeightingPotential() and DelayedWeightingPotentials(). If only dynamic
-  // *fields* were loaded, the delayed signal is identically zero and the only
-  // warning goes to stderr -- which silenceGarfieldStderr sends to /dev/null.
-  // So probe the potentials directly and fail loudly here instead.
+  // DelayedSignalTimes falls back to the field store, so probe the potential
+  // store directly; an empty one would silently zero the delayed signal.
   if (probeYCm > 0.) {
     for (const auto& s : strips) {
       const double xCm = s.centerUm * 1.e-4;
@@ -538,11 +470,7 @@ DelayedWeightingValidation ValidateDelayedWeightingData(
         out.timesNs.clear();
         return out;
       }
-      // Pick a probe time strictly inside the grid and away from t = 0.
-      // At t = 0 the delayed remainder is zero BY CONSTRUCTION (Garfield
-      // subtracts the prompt component), so probing there would report a
-      // false failure. ComponentTcad2d never stores t = 0 in the delayed
-      // grid, but ComponentGrid and ComponentUser can.
+      // Avoid t = 0, where the delayed part is zero by construction.
       double tMid = -1.;
       for (std::size_t i = out.timesNs.size(); i-- > 0;) {
         if (out.timesNs[i] > 0.) tMid = out.timesNs[i];
@@ -596,11 +524,6 @@ DelayedWeightingValidation ValidateDelayedWeightingData(
   return out;
 }
 
-/* parallel avalanche pass (OpenMP)
-- one Sensor + one AvalancheMC per thread; only the read-only field
-  components are shared. Mirrors the pattern proven in 1000MIPs.cpp.
-- per-thread signals are summed at the end (induced signals are additive)
-- without -fopenmp the pragmas are ignored and this runs serially */
 unsigned long RunAvalanchePass(
     Component& driftCmp, Component& weightingCmp,
     const std::vector<Component*>& perStripWeighting,
@@ -620,8 +543,6 @@ unsigned long RunAvalanchePass(
   const std::size_t nStrips = strips.size();
   bool useDelayedSignal = false;
   if (pc.enableSignal && pc.enableDelayedSignal) {
-    // Probe a quarter of the way into the bulk so a silently-empty delayed
-    // store is caught here rather than showing up as a missing slow lobe.
     const auto delayed = ValidateDelayedWeightingData(
         weightingCmp, strips, pc.yMin + 0.25 * (pc.yMax - pc.yMin));
     if (!delayed.available) {
@@ -656,40 +577,22 @@ unsigned long RunAvalanchePass(
     delayedSignalOut->assign(nStrips, std::vector<double>(pc.nBins, 0.));
   }
   unsigned long nTotal = 0;
-  std::atomic<unsigned long> nDone{0};  // incremented lock-free by all threads
+  std::atomic<unsigned long> nDone{0};
   const auto tStart = Clock::now();
   const long long nPrim = static_cast<long long>(primaries.size());
 
-  /* Garfield prints an oversubscription notice per avalanche when called
-     from inside an OpenMP region. That IS the intended behaviour here (one
-     Garfield thread per OpenMP thread), but it floods stderr.
-
-     THREAD SAFETY. Do NOT redirect to an ofstream's filebuf. std::cerr
-     normally uses a stdio_sync_filebuf, which is thread-safe; a std::filebuf
-     is not. AvalancheMC::DriftLine writes to std::cerr in 19 places ("Too
-     small electric field", "Too small drift velocity", "Invalid mobility",
-     ...), so with several OpenMP workers those warnings race on a shared
-     filebuf and segfault inside __ostream_insert. The null buffer below is
-     stateless -- it discards without touching any member -- so concurrent
-     calls from any number of threads are safe. */
+  // Never redirect to a filebuf: concurrent writes from workers segfault.
   static NullStreamBuf nullBuf;
   std::streambuf* oldCerr = nullptr;
   if (pc.silenceGarfieldStderr) {
     oldCerr = std::cerr.rdbuf(&nullBuf);
   }
 
-  // Garfield's TransportParticles progress meter is written to stdout.
-  // Redirect stdout for the full pass so large MIP ensembles do not emit one
-  // progress line per primary. main.cpp prints event summaries after return.
   std::streambuf* oldCoutPass = nullptr;
   if (pc.silenceGarfieldAvalancheStdout) {
-    // Same thread-safety requirement as stderr above: this redirect is live
-    // across the OpenMP region, so it must not use a filebuf.
     oldCoutPass = std::cout.rdbuf(&nullBuf);
   }
 
-  // Optional narrower setup-only suppression when full-pass suppression is
-  // disabled.
   std::streambuf* oldCout = nullptr;
   if (!oldCoutPass && pc.silenceGarfieldSetupStdout) {
     oldCout = std::cout.rdbuf(&nullBuf);
@@ -698,19 +601,14 @@ unsigned long RunAvalanchePass(
 
   #pragma omp parallel if (!pc.forceSerial)
   {
-    // Sensor construction prints to stdout; serialise it so 8 threads'
-    // messages don't interleave into garbage. Once per thread, so free.
     Sensor localSensor;
     #pragma omp critical
     {
+      // TCAD first: the sensor takes its medium from it
       localSensor.AddComponent(&driftCmp);
-      // TCAD first: the sensor takes its medium from the first component
-      // returning status 0. The screening perturbation is added second.
       if (scField) localSensor.AddComponent(scField);
       if (pc.enableSignal) {
         for (std::size_t k = 0; k < strips.size(); ++k) {
-          // ComponentGrid ignores the label, so when a per-strip vector is
-          // supplied each electrode must come from its own component.
           Component* wc = perStripWeighting.empty()
                               ? &weightingCmp
                               : perStripWeighting[k];
@@ -732,8 +630,6 @@ unsigned long RunAvalanchePass(
                           pc.xMax, pc.yMax, pc.zMax);
     }
 
-    // No worker may start avalanche processing until all local Sensors have
-    // been built and stdout has been restored by one thread.
     #pragma omp barrier
     #pragma omp single
     {
@@ -752,32 +648,25 @@ unsigned long RunAvalanchePass(
                            pc.sizeCap, pc.enableSignal);
     localAval.EnableDiffusion(pc.diffusion);
     localAval.EnableMultiplication(pc.multiplication);
-    // drift paths are stored only when we need them to deposit space
-    // charge; they cost memory, so they stay off otherwise
     if (((scDeposit || scGrid) && scCfg) || lzAcc) {
       localAval.EnableDriftLines(true);
     }
 
-    // per-thread CSV buffer: writing inside the loop would take a lock on
-    // every single pair, serialising all threads
+    // per-thread buffers avoid a lock per pair
     std::ostringstream localRows;
+    std::ostringstream localDrift;
+    long localDriftN = 0;
 
-    /* Private grid per thread. ChargeGrid::Deposit writes to four nodes
-       and is NOT thread-safe, so a shared grid would race; the copies are
-       summed under one critical section at the end instead. */
+    // ChargeGrid isn't thread-safe: private copies, summed at the end
     ChargeGrid localGrid;
     if (scGrid && scCfg) { localGrid = *scGrid; localGrid.Clear(); }
-    // Private accumulator per thread; merged under the critical section
-    // below. The sums are order-independent, so the result is deterministic
-    // apart from floating-point association.
     TransverseExtentAccumulator localLz;
 
     #pragma omp for schedule(dynamic, pc.ompDynamicChunk) reduction(+ : nTotal)
     for (long long i = 0; i < nPrim; ++i) {
       const auto& p = primaries[i];
       localAval.AvalancheElectronHole(p[0], p[1], p[2], p[3]);
-      // AddCharge is mutex-protected, so depositing from inside the
-      // parallel loop is safe. Solve() is left to the caller.
+      // AddCharge is mutex-protected
       if (scDeposit && scCfg) {
         DepositAvalancheCharge(localAval, *scDeposit, *scCfg);
       }
@@ -793,8 +682,26 @@ unsigned long RunAvalanchePass(
       if (pairsCsv) {
         localRows << p[0] * 1.e4 << "," << p[1] * 1.e4 << "," << ne << "\n";
       }
+      if (pc.driftCsv && localDriftN < pc.driftMaxCarriers) {
+        // id = thread_index: unique without a lock
+        auto dump = [&](const std::vector<AvalancheMC::EndPoint>& eps,
+                        const char* species) {
+          for (const auto& ep : eps) {
+            if (localDriftN >= pc.driftMaxCarriers) return;
+            if (ep.path.size() < 2) continue;
+            const long id = localDriftN++;
+            for (const auto& q : ep.path) {
+              localDrift << omp_get_thread_num() << "_" << id << ","
+                         << species << "," << q.x * 1.e4 << ","
+                         << q.y * 1.e4 << "," << q.t << "\n";
+            }
+          }
+        };
+        dump(localAval.GetElectrons(), "e");
+        dump(localAval.GetHoles(), "h");
+      }
       if (printEvery) {
-        const unsigned long done = ++nDone;  // atomic, no lock
+        const unsigned long done = ++nDone;
         if (done % printEvery == 0) {
           #pragma omp critical
           {
@@ -805,13 +712,11 @@ unsigned long RunAvalanchePass(
       }
     }
 
-    // superposition: summing each thread's induced signal is equivalent
-    // to having accumulated them all in one sensor. Rows are flushed here
-    // too, so mip_pairs.csv is grouped by thread rather than track order
-    // (each row carries its own x,y so order carries no information).
+    // induced signals superpose; CSV rows end up grouped by thread
     #pragma omp critical
     {
       if (pairsCsv) *pairsCsv << localRows.str();
+      if (pc.driftCsv) *pc.driftCsv << localDrift.str();
       if (lzAcc) lzAcc->Merge(localLz);
       if (scGrid && scCfg) {
         for (std::size_t i = 0; i < scGrid->rho.size(); ++i) {
@@ -844,9 +749,6 @@ unsigned long RunAvalanchePass(
   return nTotal;
 }
 
-/* convergence scan
-G_e/G_eh vs step size at a fixed injection point; avalLadder must
-already be configured via ConfigureAvalanche. */
 void RunConvergenceScan(AvalancheMC& avalLadder, double& stepCm, double x0,
                         double yInj, std::size_t sizeCap,
                         const std::string& outDir) {
@@ -859,11 +761,11 @@ void RunConvergenceScan(AvalancheMC& avalLadder, double& stepCm, double x0,
   for (std::size_t iStep = 0; iStep < std::size(distanceStepsCm); ++iStep) {
     const double thisStepCm = distanceStepsCm[iStep];
     const bool isFinest = (iStep + 1 == std::size(distanceStepsCm));
-    stepCm = thisStepCm;  // step function captured stepCm by reference
+    stepCm = thisStepCm;  // read by reference in the step function
     double res[2][2] = {{0., 0.}, {0., 0.}};  // [mode][sum, sum2]
     int nDone[2] = {0, 0};
     int nCapRung[2] = {0, 0};
-    const int nWant[2] = {200, 300};  // high-stat pass
+    const int nWant[2] = {200, 300};
     for (int mode = 0; mode < 2; ++mode) {
       if (mode == 1 && ehDivergent) {
         std::cout << "step = " << thisStepCm * 1.e7
@@ -945,10 +847,6 @@ void RunConvergenceScan(AvalancheMC& avalLadder, double& stepCm, double x0,
   }
 }
 
-/* impact-ionisation feedback comparison
-- Runs explicit seed/feedback modes for the requested models.
-- Uses adaptive statistics so heavy-tailed modes receive more events.
-- Writes v2 CSV files rather than appending a new schema to legacy results. */
 void RunModelComparison(
     AvalancheMC& avalLadder, MediumSilicon& si, double x0, double yInj,
     double stepCm, std::size_t ladderCap, const std::string& outDir,
@@ -1090,8 +988,7 @@ void RunModelComparison(
 
       if (ne >= ladderCap || nh >= ladderCap) ++r.nCapped;
 
-      // Abort clearly cap-limited feedback branches before spending many
-      // minutes sampling a quantity whose mean is set by the artificial cap.
+      // abort: the mean would be set by the cap
       const bool hardTrip = r.nCapped >= 6 && r.nCapped * 5 > r.nDone;
       const bool softTrip = r.nDone >= 50 && r.nCapped * 10 > r.nDone;
       if (hardTrip || softTrip) {
@@ -1237,18 +1134,12 @@ void RunModelComparison(
             << " s\n";
 }
 
-/* build the FEM region, grounded electrodes and mesh, then Initialise().
-   Doping is deliberately left unset so this component carries only the
-   deposited avalanche charge -- the TCAD map already holds the ionised
-   dopants, and setting doping here would double-count them. */
 bool SetupSpaceCharge(ComponentPoisson2d& sc, const SpaceChargeConfig& cfg,
                       Medium* medium) {
   if (cfg.xMaxCm <= cfg.xMinCm || cfg.yMaxCm <= cfg.yMinCm) {
     std::cerr << "SetupSpaceCharge: degenerate region." << std::endl;
     return false;
   }
-  // rectangle: ComponentPoisson2d wants edges parallel to x or y,
-  // anything else is approximated by a staircase
   const std::vector<double> xv = {cfg.xMinCm, cfg.xMaxCm,
                                   cfg.xMaxCm, cfg.xMinCm};
   const std::vector<double> yv = {cfg.yMinCm, cfg.yMinCm,
@@ -1258,9 +1149,7 @@ bool SetupSpaceCharge(ComponentPoisson2d& sc, const SpaceChargeConfig& cfg,
               << "a dielectric constant?)." << std::endl;
     return false;
   }
-  // grounded Dirichlet boundaries. The electrode potentials themselves
-  // live in the TCAD map; this component only carries the perturbation,
-  // so both planes sit at 0 V.
+  // perturbation only, so both planes at 0 V
   sc.AddElectrode(cfg.xMinCm, cfg.yMinCm, cfg.xMaxCm, cfg.yMinCm, 0., "top");
   sc.AddElectrode(cfg.xMinCm, cfg.yMaxCm, cfg.xMaxCm, cfg.yMaxCm, 0., "back");
   sc.SetRangeZ(cfg.zMinCm, cfg.zMaxCm);
@@ -1270,9 +1159,7 @@ bool SetupSpaceCharge(ComponentPoisson2d& sc, const SpaceChargeConfig& cfg,
     std::cerr << "SetupSpaceCharge: Initialise() failed." << std::endl;
     return false;
   }
-  // pre-solve the weighting potentials: the lazy path is mutex-guarded,
-  // so leaving it to first use inside a parallel region would serialise
-  // the threads on the first hit
+  // pre-solve so threads don't serialise on the lazy mutex
   sc.RequestWeightingPotential("top");
   sc.RequestWeightingPotential("back");
   if (cfg.verbose) {
@@ -1284,10 +1171,6 @@ bool SetupSpaceCharge(ComponentPoisson2d& sc, const SpaceChargeConfig& cfg,
   return true;
 }
 
-/* deposit one avalanche's carriers, weighted by residence time.
-   AddCharge takes elementary charges per cm of depth, so the carrier
-   count is divided by the effective z-extent. Electrons negative, holes
-   positive: their spatial separation is what opposes the field. */
 std::size_t DepositAvalancheCharge(const AvalancheMC& aval,
                                    ComponentPoisson2d& sc,
                                    const SpaceChargeConfig& cfg) {
@@ -1307,7 +1190,7 @@ std::size_t DepositAvalancheCharge(const AvalancheMC& aval,
       for (std::size_t k = 0; k + 1 < ep.path.size(); ++k) {
         const auto& p0 = ep.path[k];
         const auto& p1 = ep.path[k + 1];
-        const double dt = p1.t - p0.t;   // ns spent in this segment
+        const double dt = p1.t - p0.t;
         if (dt <= 0.) continue;
         if (!sc.AddCharge(0.5 * (p0.x + p1.x), 0.5 * (p0.y + p1.y), w * dt)) {
           ++nOutside;
@@ -1326,9 +1209,6 @@ std::size_t DepositAvalancheCharge(const AvalancheMC& aval,
   return nOutside;
 }
 
-// --------------------------------------------------------------------
-// Transport-derived L_z.
-// --------------------------------------------------------------------
 void TransverseExtentAccumulator::Add(const AvalancheMC& aval,
                                       const double yLoCm, const double yHiCm,
                                       const bool useElectrons,
@@ -1342,11 +1222,10 @@ void TransverseExtentAccumulator::Add(const AvalancheMC& aval,
       for (std::size_t k = 0; k + 1 < ep.path.size(); ++k) {
         const auto& p0 = ep.path[k];
         const auto& p1 = ep.path[k + 1];
-        const double dt = p1.t - p0.t;      // ns in this segment
+        const double dt = p1.t - p0.t;
         if (dt <= 0.) continue;
         const double ym = 0.5 * (p0.y + p1.y);
         if (!bandAll && (ym < yLoCm || ym > yHiCm)) continue;
-        // Midpoint, matching how DepositAvalancheCharge places charge.
         const double zm = 0.5 * (p0.z + p1.z);
         const double wdt = w * dt;
         sumW += wdt;
@@ -1373,10 +1252,9 @@ TransverseExtent TransverseExtentAccumulator::Finish() const {
   r.nSegments = nSegments;
   r.nCarriersNoPath = nCarriersNoPath;
   r.weightNsE = sumW;
-  if (sumW <= 0. || nSegments < 2) return r;   // valid stays false
+  if (sumW <= 0. || nSegments < 2) return r;
   r.zBarCm = sumWz / sumW;
-  // Var = <z^2> - <z>^2. Clamp: catastrophic cancellation can make this
-  // very slightly negative when the spread is far below the mean offset.
+  // clamp: cancellation can go slightly negative
   const double var = std::max(0., sumWz2 / sumW - r.zBarCm * r.zBarCm);
   r.sigmaZCm = std::sqrt(var);
   r.lzCm = std::sqrt(12.) * r.sigmaZCm;
@@ -1488,8 +1366,6 @@ ScreeningFieldChange CompareScreeningFieldGrids(
   return out;
 }
 
-/* screening-field diagnostic. A few thousand V/cm against a ~376 kV/cm
-   gain layer is the expected scale. */
 void ReportScreeningField(ComponentPoisson2d& sc,
                           const SpaceChargeConfig& cfg) {
   const auto r = SampleScreeningField(sc, cfg);
@@ -1498,8 +1374,6 @@ void ReportScreeningField(ComponentPoisson2d& sc,
             << " probe = " << r.magnitudeVcm << " V/cm"
             << " (status " << r.status << ")" << std::endl;
 }
-
-/* ---- spatial charge mixing ------------------------------------------ */
 
 void ChargeGrid::Init(const SpaceChargeConfig& cfg) {
   nx = std::max(2, cfg.mixNx);
@@ -1528,9 +1402,7 @@ double ChargeGrid::AbsoluteTotal() const {
   return t;
 }
 
-/* cloud-in-cell: split q among the four surrounding nodes by bilinear
-   weight. Conserves charge exactly and keeps sub-cell position, unlike
-   dumping the whole cell's charge at its centre. */
+// cloud-in-cell (bilinear) deposit
 void ChargeGrid::Deposit(const double xCm, const double yCm,
                          const double q) {
   if (nx < 2 || ny < 2 || invDx <= 0. || invDy <= 0.) return;
@@ -1599,9 +1471,7 @@ void LoadChargeGrid(ComponentPoisson2d& sc, const ChargeGrid& grid) {
       ? (grid.xMaxCm - grid.xMinCm) / (grid.nx - 1) : 0.;
   const double dy = grid.ny > 1
       ? (grid.yMaxCm - grid.yMinCm) / (grid.ny - 1) : 0.;
-  // Exact boundary coordinates may not belong to a FEM element under
-  // strict lookup tests. Nudge boundary grid nodes a negligible distance
-  // inside while retaining their charge and relative position.
+  // nudge boundary nodes inside; exact edges fail element lookup
   const double epsX = std::max(1.e-12, 1.e-6 * std::abs(dx));
   const double epsY = std::max(1.e-12, 1.e-6 * std::abs(dy));
   for (int iy = 0; iy < grid.ny; ++iy) {
@@ -1637,9 +1507,6 @@ void ApplyRelaxedCharge(ComponentPoisson2d& sc, ChargeGrid& mixed,
     std::cerr << "ApplyRelaxedCharge: grid size mismatch.\n";
     return;
   }
-  // Poisson is linear, so blending the density is exactly equivalent to
-  // blending the resulting fields -- and unlike a scalar amplitude
-  // rescale it is valid even when the cloud changes shape.
   for (std::size_t i = 0; i < mixed.rho.size(); ++i) {
     mixed.rho[i] = (1. - lam) * mixed.rho[i] + lam * fresh.rho[i];
   }
